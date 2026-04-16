@@ -451,6 +451,7 @@ function getOrCreateAccountRuntimeStats(accountId) {
   if (!stats) {
     stats = {
       recentSuccesses: [],
+      unavailableModes: {},
       selectionCount: 0,
       lastSelectedAtMs: 0,
       lastSuccessAtMs: 0,
@@ -523,6 +524,7 @@ function buildAccountRuntimeSummary(accountId, now = Date.now()) {
     cooldownUntilMs: stats?.cooldownUntilMs || 0,
     isCoolingDown: Boolean(stats?.cooldownUntilMs && stats.cooldownUntilMs > now),
     consecutiveSlowCount: stats?.consecutiveSlowCount || 0,
+    unavailableModes: stats?.unavailableModes || {},
   }
 }
 
@@ -538,7 +540,7 @@ function markAccountSelected(accountId, selectedAtMs = Date.now()) {
 
 function markAccountSuccess(
   accountId,
-  { durationMs = 0, outputTokens = 0, reason = 'success' } = {},
+  { durationMs = 0, outputTokens = 0, reason = 'success', mode = null } = {},
 ) {
   const stats = getOrCreateAccountRuntimeStats(accountId)
   if (!stats) {
@@ -562,6 +564,9 @@ function markAccountSuccess(
   stats.lastSuccessAtMs = now
   stats.lastFailureReason = null
   stats.cooldownUntilMs = 0
+  if (mode) {
+    delete stats.unavailableModes?.[mode]
+  }
   if (tps < ACCOUNT_SLOW_TPS_THRESHOLD || durationMs > ACCOUNT_SLOW_DURATION_MS) {
     stats.consecutiveSlowCount += 1
   } else {
@@ -587,6 +592,37 @@ function markAccountFailure(
   stats.cooldownUntilMs = cooldownMs > 0 ? now + cooldownMs : 0
 
   return buildAccountRuntimeSummary(accountId, now)
+}
+
+function markAccountModeUnavailable(accountId, mode, reason = 'mode_unavailable') {
+  const stats = getOrCreateAccountRuntimeStats(accountId)
+  if (!stats || !mode) {
+    return buildAccountRuntimeSummary(accountId)
+  }
+
+  if (!stats.unavailableModes || typeof stats.unavailableModes !== 'object') {
+    stats.unavailableModes = {}
+  }
+
+  const now = Date.now()
+  stats.unavailableModes[mode] = {
+    reason,
+    updatedAtMs: now,
+  }
+  stats.lastFailureAtMs = now
+  stats.lastFailureReason = reason
+  stats.cooldownUntilMs = 0
+
+  return buildAccountRuntimeSummary(accountId, now)
+}
+
+function isAccountModeUnavailable(accountId, mode) {
+  if (!accountId || !mode) {
+    return false
+  }
+
+  const stats = accountRuntimeStats.get(accountId)
+  return Boolean(stats?.unavailableModes?.[mode])
 }
 
 function describeSelectionReason(kind, account, summary) {
@@ -646,6 +682,7 @@ function selectAccountForRequest(session, excludedAccountIds = [], strategy = 'p
   }
 
   const now = Date.now()
+  const mode = session?.costMode || runtimeConfig.costMode
   const candidates = availableAccounts.map((account) => {
     const summary = buildAccountRuntimeSummary(account.accountId, now)
     return {
@@ -655,8 +692,17 @@ function selectAccountForRequest(session, excludedAccountIds = [], strategy = 'p
     }
   })
 
-  const activeCandidates = candidates.filter((candidate) => !candidate.summary.isCoolingDown)
-  const pool = activeCandidates.length > 0 ? activeCandidates : candidates
+  const modeEligibleCandidates = candidates.filter(
+    (candidate) => !isAccountModeUnavailable(candidate.account.accountId, mode),
+  )
+  if (modeEligibleCandidates.length === 0) {
+    return null
+  }
+
+  const activeCandidates = modeEligibleCandidates.filter(
+    (candidate) => !candidate.summary.isCoolingDown,
+  )
+  const pool = activeCandidates.length > 0 ? activeCandidates : modeEligibleCandidates
   const coldStartCandidates = pool.filter(
     (candidate) =>
       candidate.summary.sampleCount === 0 && candidate.summary.lastSelectedAtMs === 0,
@@ -2171,6 +2217,49 @@ async function fetchJson(url, options = {}) {
   }
 }
 
+function extractCodebuffErrorDetail(payload) {
+  if (!payload) {
+    return null
+  }
+
+  if (typeof payload === 'string') {
+    return {
+      message: payload,
+      code: null,
+      type: null,
+    }
+  }
+
+  const error = payload.error && typeof payload.error === 'object'
+    ? payload.error
+    : null
+
+  return {
+    message:
+      error?.message ||
+      payload.message ||
+      (typeof payload.error === 'string' ? payload.error : null) ||
+      null,
+    code:
+      error?.code ||
+      payload.code ||
+      (typeof payload.error === 'string' ? payload.error : null) ||
+      null,
+    type: error?.type || payload.type || null,
+  }
+}
+
+function buildCodebuffRequestError(response, fallbackMessage) {
+  const detail = extractCodebuffErrorDetail(response?.data)
+  const message = detail?.message || response?.text || fallbackMessage
+  const error = new Error(message)
+  error.statusCode = response?.status || 500
+  error.errorCode = detail?.code || detail?.message || null
+  error.errorType = detail?.type || null
+  error.errorBody = response?.data || null
+  return error
+}
+
 async function callCodebuffJson(token, pathname, body) {
   return fetchJson(`${CONFIG.apiBaseUrl}${pathname}`, {
     method: 'POST',
@@ -2285,17 +2374,7 @@ async function executeCodebuffChatCompletion({
   }
 
   if (!response.ok) {
-    throw Object.assign(
-      new Error(
-        response.data?.error ||
-          response.data?.message ||
-          response.text ||
-          'Codebuff completion request failed.',
-      ),
-      {
-        statusCode: response.status || 500,
-      },
-    )
+    throw buildCodebuffRequestError(response, 'Codebuff completion request failed.')
   }
 
   return response
@@ -2311,6 +2390,63 @@ function isRetryableAccountFailure(error) {
     error?.statusCode === 429 ||
     (typeof error?.statusCode === 'number' && error.statusCode >= 500)
   )
+}
+
+function isModeUnavailableError(error, mode) {
+  if (!mode || !error) {
+    return false
+  }
+
+  const code = String(error.errorCode || error.message || '').toLowerCase()
+  return code === `${String(mode).toLowerCase()}_mode_unavailable`
+}
+
+function getFallbackModeForSession(session, error = null) {
+  const currentMode = session?.costMode || runtimeConfig.costMode
+  if (currentMode === 'free' && (!error || isModeUnavailableError(error, currentMode))) {
+    return 'default'
+  }
+  return null
+}
+
+function shouldFallbackSessionMode(session, error = null) {
+  const currentMode = session?.costMode || runtimeConfig.costMode
+  if (!getFallbackModeForSession(session, error)) {
+    return false
+  }
+
+  const availableAccounts = listAvailableAccounts()
+  if (availableAccounts.length === 0) {
+    return false
+  }
+
+  return (
+    isModeUnavailableError(error, currentMode) ||
+    availableAccounts.every((account) =>
+      isAccountModeUnavailable(account.accountId, currentMode),
+    )
+  )
+}
+
+async function fallbackSessionMode(session, reason, fallbackMode = null) {
+  if (!session) {
+    return false
+  }
+
+  const nextMode = fallbackMode || getFallbackModeForSession(session)
+  if (!nextMode || session.costMode === nextMode) {
+    return false
+  }
+
+  const account = getSessionBoundAccount(session)
+  await finishSessionRun(account?.authToken, session, 'cancelled')
+  resetSessionRunState(session, reason || `Mode fallback to ${nextMode}.`)
+  session.costMode = nextMode
+  session.agentId = getAgentIdForMode(nextMode)
+  session.updatedAt = new Date().toISOString()
+  session.lastError = reason || `Mode fallback to ${nextMode}.`
+  bridgeSessions.set(session.session, session)
+  return true
 }
 
 function createMissingCredentialsError() {
@@ -2480,6 +2616,66 @@ function summarizeAnthropicTools(tools) {
   }
 }
 
+async function executeWithAccountSelectionRecovery(session, executeSelection) {
+  let excludedAccountIds = []
+  let strategy = 'performance'
+  let lastError = null
+  let attemptedModeFallback = false
+
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const selection = selectAccountForRequest(session, excludedAccountIds, strategy)
+    if (!selection?.account) {
+      if (!attemptedModeFallback && shouldFallbackSessionMode(session, lastError)) {
+        const nextMode = getFallbackModeForSession(session, lastError)
+        await fallbackSessionMode(
+          session,
+          `Mode fallback: ${session.costMode} -> ${nextMode} (${lastError?.message || 'mode unavailable'})`,
+          nextMode,
+        )
+        excludedAccountIds = []
+        strategy = 'mode_fallback'
+        attemptedModeFallback = true
+        continue
+      }
+
+      throw lastError || createMissingCredentialsError()
+    }
+
+    try {
+      return await executeSelection(selection)
+    } catch (error) {
+      session.lastError = error?.message || 'Unknown account execution error.'
+      bridgeSessions.set(session.session, session)
+
+      if (!isRetryableAccountFailure(error)) {
+        throw error
+      }
+
+      const activeMode = session.costMode || runtimeConfig.costMode
+      if (isModeUnavailableError(error, activeMode)) {
+        markAccountModeUnavailable(
+          selection.account.accountId,
+          activeMode,
+          error?.message || `${activeMode}_mode_unavailable`,
+        )
+      } else {
+        markAccountFailure(
+          selection.account.accountId,
+          `http_${error?.statusCode || 'error'}`,
+        )
+      }
+
+      excludedAccountIds = Array.from(
+        new Set([...excludedAccountIds, selection.account.accountId]),
+      )
+      strategy = 'retry'
+      lastError = error
+    }
+  }
+
+  throw lastError || createMissingCredentialsError()
+}
+
 async function streamAnthropicRequest(res, { sessionName, body, headers, url }) {
   return withSessionLock(sessionName, async () => {
     if (shouldResetSession(body, headers)) {
@@ -2529,42 +2725,54 @@ async function streamAnthropicRequest(res, { sessionName, body, headers, url }) 
           const errText = upstream.bodyUsed ? text : await upstream.text()
           let errData = null
           try { errData = JSON.parse(errText) } catch {}
-          throw Object.assign(
-            new Error(errData?.error || errData?.message || errText || 'Codebuff completion failed.'),
-            { statusCode: upstream.status || 500 },
+          throw buildCodebuffRequestError(
+            {
+              status: upstream.status || 500,
+              text: errText,
+              data: errData,
+            },
+            'Codebuff completion failed.',
           )
         }
       }
       return upstream
     }
 
-    const selection = selectAccountForRequest(session)
-    if (!selection?.account) throw createMissingCredentialsError()
-    const { score } = selection
-    let { account, reason } = selection
-    let activePreviousAccountId = null
+    const {
+      upstream,
+      account,
+      reason,
+      score,
+      previousAccount,
+      switched,
+      activePreviousAccountId,
+      accountAttemptStartedAt,
+    } = await executeWithAccountSelectionRecovery(session, async (selection) => {
+      const { account, reason, score, previousAccountId } = selection
+      if (!account?.authToken) {
+        throw createMissingCredentialsError()
+      }
 
-    markAccountSelected(account.accountId)
-    let { previousAccount, switched } = await assignSessionToAccount(session, account, reason)
-    const accountAttemptStartedAt = Date.now()
-
-    let upstream
-    try {
-      upstream = await acquireUpstream(account.authToken, session)
-    } catch (error) {
-      session.lastError = error?.message || 'Unknown error'
-      bridgeSessions.set(sessionName, session)
-      if (!isRetryableAccountFailure(error)) throw error
-      markAccountFailure(account.accountId, `http_${error?.statusCode || 'error'}`)
-      const retrySelection = selectAccountForRequest(session, [account.accountId], 'retry')
-      if (!retrySelection?.account) throw error
-      activePreviousAccountId = account.accountId
-      account = retrySelection.account
-      reason = retrySelection.reason
       markAccountSelected(account.accountId)
-      ;({ previousAccount, switched } = await assignSessionToAccount(session, account, reason))
-      upstream = await acquireUpstream(account.authToken, session)
-    }
+      const { previousAccount, switched } = await assignSessionToAccount(
+        session,
+        account,
+        reason,
+      )
+      const accountAttemptStartedAt = Date.now()
+      const upstream = await acquireUpstream(account.authToken, session)
+
+      return {
+        upstream,
+        account,
+        reason,
+        score,
+        previousAccount,
+        switched,
+        activePreviousAccountId: previousAccount?.accountId || previousAccountId,
+        accountAttemptStartedAt,
+      }
+    })
 
     // Headers are confirmed OK — start writing SSE to client
     const msgId = `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`
@@ -2688,7 +2896,10 @@ async function streamAnthropicRequest(res, { sessionName, body, headers, url }) 
     setImmediate(() => {
       const accountDurationMs = endedAt - accountAttemptStartedAt
       const runtimeSummary = markAccountSuccess(account.accountId, {
-        durationMs: accountDurationMs, outputTokens, reason: stopReason,
+        durationMs: accountDurationMs,
+        outputTokens,
+        reason: stopReason,
+        mode: session.costMode,
       })
       session.requestCount += 1
       session.turns += 1
@@ -2818,6 +3029,7 @@ async function executeAnthropicRequest({ sessionName, body, headers, url }) {
         durationMs: accountDurationMs,
         outputTokens: anthropicMessage.usage.output_tokens,
         reason: anthropicMessage.stop_reason,
+        mode: session.costMode,
       })
 
       session.requestCount += 1
@@ -2867,36 +3079,7 @@ async function executeAnthropicRequest({ sessionName, body, headers, url }) {
       return anthropicMessage
     }
 
-    const selection = selectAccountForRequest(session)
-    if (!selection?.account) {
-      throw createMissingCredentialsError()
-    }
-
-    try {
-      return await executeWithSelection(selection)
-    } catch (error) {
-      session.lastError = error?.message || 'Unknown account execution error.'
-      bridgeSessions.set(sessionName, session)
-
-      if (!isRetryableAccountFailure(error)) {
-        throw error
-      }
-
-      markAccountFailure(
-        selection.account.accountId,
-        `http_${error?.statusCode || 'error'}`,
-      )
-      const retrySelection = selectAccountForRequest(
-        session,
-        [selection.account.accountId],
-        'retry',
-      )
-      if (!retrySelection?.account) {
-        throw error
-      }
-
-      return executeWithSelection(retrySelection)
-    }
+    return executeWithAccountSelectionRecovery(session, executeWithSelection)
   })
 }
 
@@ -2951,6 +3134,7 @@ async function executeOpenAIRequest({ sessionName, body, headers }) {
         durationMs: accountDurationMs,
         outputTokens: usage.completion_tokens || 0,
         reason: response.data?.choices?.[0]?.finish_reason || 'stop',
+        mode: session.costMode,
       })
       session.requestCount += 1
       session.turns += 1
@@ -2997,36 +3181,7 @@ async function executeOpenAIRequest({ sessionName, body, headers }) {
       return buildCompletionResponse(publicModel, response.data)
     }
 
-    const selection = selectAccountForRequest(session)
-    if (!selection?.account) {
-      throw createMissingCredentialsError()
-    }
-
-    try {
-      return await executeWithSelection(selection)
-    } catch (error) {
-      session.lastError = error?.message || 'Unknown account execution error.'
-      bridgeSessions.set(sessionName, session)
-
-      if (!isRetryableAccountFailure(error)) {
-        throw error
-      }
-
-      markAccountFailure(
-        selection.account.accountId,
-        `http_${error?.statusCode || 'error'}`,
-      )
-      const retrySelection = selectAccountForRequest(
-        session,
-        [selection.account.accountId],
-        'retry',
-      )
-      if (!retrySelection?.account) {
-        throw error
-      }
-
-      return executeWithSelection(retrySelection)
-    }
+    return executeWithAccountSelectionRecovery(session, executeWithSelection)
   })
 }
 
