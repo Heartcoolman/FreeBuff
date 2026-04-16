@@ -51,7 +51,7 @@
           <div class="panel-head">
             <div>
               <p class="label">运行时</p>
-              <h2>模型与 Agent</h2>
+              <h2>模型与模式</h2>
             </div>
             <span class="pill pill-soft">保存后会清空现有会话</span>
           </div>
@@ -61,22 +61,14 @@
               <input id="config-model-alias" name="modelAlias" type="text" />
             </label>
             <label class="field">
-              <span>桥接 Agent ID</span>
-              <input id="config-agent-id" name="agentId" type="text" />
+              <span>Codebuff 模式</span>
+              <select id="config-mode" name="mode"></select>
+              <p id="config-mode-help" class="muted" style="margin: 4px 0 0;"></p>
+              <p class="muted" style="margin: 0;">派生 Agent：<code id="config-agent-id"></code></p>
             </label>
             <label class="field">
               <span>后端模型</span>
               <select id="config-backend-model" name="backendModel"></select>
-            </label>
-            <label class="field">
-              <span>计费模式</span>
-              <select id="config-cost-mode" name="costMode">
-                <option value="free">free</option>
-                <option value="normal">normal</option>
-                <option value="max">max</option>
-                <option value="ask">ask</option>
-                <option value="plan">plan</option>
-              </select>
             </label>
             <div class="button-row">
               <button type="submit" class="button button-primary">保存运行配置</button>

@@ -20,7 +20,7 @@ Claude Code / 其他客户端
 - 支持流式（SSE）与非流式响应
 - 支持原生工具、MCP 工具、插件工具
 
-当前固定使用 **Free 模式**，可选后端模型：
+当前支持 **Free / Default / Lite / Max / Plan** 模式，其中 `free` 模式可选后端模型：
 
 | 模型 | 提供方 |
 |------|--------|
@@ -114,7 +114,7 @@ curl "http://127.0.0.1:8765/v1/freebuff/login/status?session=login"
 访问 `http://127.0.0.1:8765`，提供：
 
 - 账号池状态、逐账号登录/登出操作
-- 运行时配置（模型别名、Agent ID、后端模型）
+- 运行时配置（模型别名、Codebuff 模式、后端模型）
 - 活跃会话列表、会话绑定账号与重置
 - Token 用量统计（按请求明细）
 - Claude Code 工具协议兼容状态
@@ -127,7 +127,9 @@ curl "http://127.0.0.1:8765/v1/freebuff/login/status?session=login"
 | `HOST` | `127.0.0.1` | 监听地址 |
 | `CODEBUFF_API_KEY` | — | 直接提供 API Token |
 | `FREEBUFF_MODEL` | `freebuff-bridge` | Claude 侧模型别名 |
-| `FREEBUFF_AGENT_ID` | `base2-free` | Codebuff Agent ID |
+| `FREEBUFF_MODE` | `free` | Codebuff 模式，支持 `free/default/lite/max/plan` |
+| `FREEBUFF_COST_MODE` | `free` | 兼容旧配置的模式别名，等同于 `FREEBUFF_MODE` |
+| `FREEBUFF_AGENT_ID` | `base2-free` | 兼容旧配置的底层 Agent ID，会自动映射到对应模式 |
 | `FREEBUFF_BACKEND_MODEL` | `z-ai/glm-5.1` | 后端实际模型 |
 | `FREEBUFF_RESPONSE_TIMEOUT_MS` | `180000` | 请求超时（毫秒） |
 | `FREEBUFF_USAGE_HISTORY_LIMIT` | `500` | 内存中保留的用量条数 |

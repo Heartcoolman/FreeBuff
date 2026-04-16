@@ -11,7 +11,10 @@ const CONFIG = {
   cwd: process.env.FREEBUFF_CWD || process.cwd(),
   defaultModel: process.env.FREEBUFF_MODEL || 'freebuff-bridge',
   defaultAgentId: process.env.FREEBUFF_AGENT_ID || 'base2-free',
-  defaultCostMode: process.env.FREEBUFF_COST_MODE || 'free',
+  defaultMode:
+    process.env.FREEBUFF_MODE ||
+    process.env.FREEBUFF_COST_MODE ||
+    'free',
   defaultSessionId: process.env.FREEBUFF_SESSION_ID || 'default',
   loginSessionId: process.env.FREEBUFF_LOGIN_SESSION_ID || 'login',
   responseTimeoutMs: Number(process.env.FREEBUFF_RESPONSE_TIMEOUT_MS || 180_000),
@@ -23,10 +26,81 @@ const CONFIG = {
 const APP_DIR = path.dirname(fileURLToPath(import.meta.url))
 const PUBLIC_DIR = path.join(APP_DIR, 'public')
 
+const MODE_DEFINITIONS = {
+  free: {
+    value: 'free',
+    label: 'Free',
+    agentId: 'base2-free',
+    description: '免费优先模式，适合日常桥接与多账号轮训。',
+  },
+  default: {
+    value: 'default',
+    label: 'Default',
+    agentId: 'base2',
+    description: '通用默认模式，平衡速度、稳定性和规划能力。',
+  },
+  lite: {
+    value: 'lite',
+    label: 'Lite',
+    agentId: 'base2-lite',
+    description: '更轻更快，适合小修改、快速迭代和低开销任务。',
+  },
+  max: {
+    value: 'max',
+    label: 'Max',
+    agentId: 'base2-max',
+    description: '更强推理与更重规划，适合复杂改动。',
+  },
+  plan: {
+    value: 'plan',
+    label: 'Plan',
+    agentId: 'base2-plan',
+    description: '偏规划与方案推演，适合先出计划再执行的场景。',
+  },
+}
+
+const MODE_ALIASES = {
+  normal: 'default',
+  ask: 'lite',
+}
+
+function normalizeMode(rawMode) {
+  if (typeof rawMode !== 'string' || !rawMode.trim()) {
+    return null
+  }
+
+  const normalized = rawMode.trim().toLowerCase()
+  return MODE_DEFINITIONS[normalized]
+    ? normalized
+    : MODE_ALIASES[normalized] || null
+}
+
+function inferModeFromAgentId(agentId) {
+  if (typeof agentId !== 'string' || !agentId.trim()) {
+    return null
+  }
+
+  const normalizedAgentId = agentId.trim()
+  return (
+    Object.values(MODE_DEFINITIONS).find(
+      (mode) => mode.agentId === normalizedAgentId,
+    )?.value || null
+  )
+}
+
+function getAgentIdForMode(mode) {
+  return MODE_DEFINITIONS[mode]?.agentId || MODE_DEFINITIONS.free.agentId
+}
+
+const initialMode =
+  normalizeMode(CONFIG.defaultMode) ||
+  inferModeFromAgentId(CONFIG.defaultAgentId) ||
+  'free'
+
 const runtimeConfig = {
   modelAlias: CONFIG.defaultModel,
-  agentId: CONFIG.defaultAgentId,
-  costMode: CONFIG.defaultCostMode,
+  agentId: CONFIG.defaultAgentId || getAgentIdForMode(initialMode),
+  costMode: initialMode,
   backendModel: process.env.FREEBUFF_BACKEND_MODEL || 'z-ai/glm-5.1',
 }
 
@@ -35,14 +109,8 @@ const FREE_BACKEND_MODELS = [
   { value: 'minimax/minimax-m2.7', label: 'MiniMax M2.7', provider: 'MiniMax' },
 ]
 
-const VALID_COST_MODES = new Set(['free', 'normal', 'max', 'ask', 'plan'])
-
-const DEFAULT_AGENT_IDS = {
-  free: 'base2-free',
-  normal: 'base2',
-  max: 'base2-max',
-  ask: 'ask',
-  plan: 'base2-plan',
+if (!inferModeFromAgentId(runtimeConfig.agentId)) {
+  runtimeConfig.agentId = getAgentIdForMode(runtimeConfig.costMode)
 }
 
 let openRouterModelsCache = null
@@ -442,6 +510,15 @@ async function getRuntimeConfig() {
     mode === 'free' ? FREE_BACKEND_MODELS : await getOpenRouterModels()
   return {
     modelAlias: runtimeConfig.modelAlias,
+    mode,
+    modeLabel: MODE_DEFINITIONS[mode]?.label || mode,
+    modeDescription: MODE_DEFINITIONS[mode]?.description || '',
+    availableModes: Object.values(MODE_DEFINITIONS).map((item) => ({
+      value: item.value,
+      label: item.label,
+      description: item.description,
+      agentId: item.agentId,
+    })),
     agentId: runtimeConfig.agentId,
     costMode: mode,
     backendModel: runtimeConfig.backendModel,
@@ -591,15 +668,19 @@ async function applyRuntimeConfig(updates = {}) {
   }
 
   const userSetAgentId = typeof updates.agentId === 'string' && updates.agentId.trim()
-  if (userSetAgentId) {
-    runtimeConfig.agentId = updates.agentId.trim()
-  }
-
-  if (typeof updates.costMode === 'string' && VALID_COST_MODES.has(updates.costMode)) {
+  const nextMode = normalizeMode(updates.mode ?? updates.costMode)
+  if (nextMode) {
     const prevMode = runtimeConfig.costMode
-    runtimeConfig.costMode = updates.costMode
-    if (!userSetAgentId && updates.costMode !== prevMode) {
-      runtimeConfig.agentId = DEFAULT_AGENT_IDS[updates.costMode]
+    runtimeConfig.costMode = nextMode
+    if (!userSetAgentId || nextMode !== prevMode) {
+      runtimeConfig.agentId = getAgentIdForMode(nextMode)
+    }
+  } else if (userSetAgentId) {
+    const legacyAgentId = updates.agentId.trim()
+    runtimeConfig.agentId = legacyAgentId
+    const inferredMode = inferModeFromAgentId(legacyAgentId)
+    if (inferredMode) {
+      runtimeConfig.costMode = inferredMode
     }
   }
 
@@ -620,8 +701,8 @@ async function applyRuntimeConfig(updates = {}) {
   const next = await getRuntimeConfig()
   const changed =
     previous.modelAlias !== next.modelAlias ||
+    previous.mode !== next.mode ||
     previous.agentId !== next.agentId ||
-    previous.costMode !== next.costMode ||
     previous.backendModel !== next.backendModel
 
   if (changed) {
@@ -2237,7 +2318,10 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && url.pathname === '/v1/freebuff/models') {
-      const mode = url.searchParams.get('costMode') || runtimeConfig.costMode
+      const mode =
+        normalizeMode(
+          url.searchParams.get('mode') || url.searchParams.get('costMode'),
+        ) || runtimeConfig.costMode
       const models =
         mode === 'free' ? FREE_BACKEND_MODELS : await getOpenRouterModels()
       sendJson(res, 200, { ok: true, models })
@@ -2332,6 +2416,7 @@ const server = createServer(async (req, res) => {
         cwd: CONFIG.cwd,
         model: runtimeConfig.modelAlias,
         agent: runtimeConfig.agentId,
+        mode: runtimeConfig.costMode,
         backendModel: runtimeConfig.backendModel,
         costMode: runtimeConfig.costMode,
         authenticated: auth.authenticated,
@@ -2505,6 +2590,6 @@ const server = createServer(async (req, res) => {
 
 server.listen(CONFIG.port, CONFIG.host, () => {
   console.log(
-    `Freebuff bridge listening on http://${CONFIG.host}:${CONFIG.port} using cwd ${CONFIG.cwd}, model ${runtimeConfig.modelAlias}, agent ${runtimeConfig.agentId}`,
+    `Freebuff bridge listening on http://${CONFIG.host}:${CONFIG.port} using cwd ${CONFIG.cwd}, model ${runtimeConfig.modelAlias}, mode ${runtimeConfig.costMode}, agent ${runtimeConfig.agentId}`,
   )
 })

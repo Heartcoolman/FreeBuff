@@ -10,6 +10,39 @@ const fallbackBackendModels = {
   ],
 }
 
+const fallbackModes = [
+  {
+    value: 'free',
+    label: 'Free',
+    description: '免费优先模式，适合本地桥接和多账号轮训。',
+    agentId: 'base2-free',
+  },
+  {
+    value: 'default',
+    label: 'Default',
+    description: '通用默认模式，平衡速度、规划和稳定性。',
+    agentId: 'base2',
+  },
+  {
+    value: 'lite',
+    label: 'Lite',
+    description: '更轻更快，适合小改动与快速迭代。',
+    agentId: 'base2-lite',
+  },
+  {
+    value: 'max',
+    label: 'Max',
+    description: '更强推理与更重规划，适合复杂任务。',
+    agentId: 'base2-max',
+  },
+  {
+    value: 'plan',
+    label: 'Plan',
+    description: '偏规划和方案推演，适合先出计划。',
+    agentId: 'base2-plan',
+  },
+]
+
 function populateModelDropdown(models, selectedValue) {
   const opts = [...models]
   if (selectedValue && !opts.some((m) => m.value === selectedValue)) {
@@ -37,9 +70,10 @@ const els = {
   resetUsage: document.querySelector('#reset-usage'),
   configForm: document.querySelector('#config-form'),
   configModelAlias: document.querySelector('#config-model-alias'),
+  configMode: document.querySelector('#config-mode'),
+  configModeHelp: document.querySelector('#config-mode-help'),
   configAgentId: document.querySelector('#config-agent-id'),
   configBackendModel: document.querySelector('#config-backend-model'),
-  configCostMode: document.querySelector('#config-cost-mode'),
   tutorialModelAlias: document.querySelector('#tutorial-model-alias'),
   tutorialModelCommand: document.querySelector('#tutorial-model-command'),
   tutorialSettingsJson: document.querySelector('#tutorial-settings-json'),
@@ -153,6 +187,26 @@ function formatAccountName(account) {
 
 function accountStatusPill(label, tone = 'neutral') {
   return `<span class="account-status account-status-${tone}">${label}</span>`
+}
+
+function populateModeDropdown(modes, selectedValue) {
+  const options = Array.isArray(modes) && modes.length > 0 ? modes : fallbackModes
+  els.configMode.innerHTML = options
+    .map((mode) => `<option value="${mode.value}">${mode.label}</option>`)
+    .join('')
+  els.configMode.value = selectedValue || options[0]?.value || 'free'
+}
+
+function resolveModeDefinition(config) {
+  const modes =
+    Array.isArray(config.availableModes) && config.availableModes.length > 0
+      ? config.availableModes
+      : fallbackModes
+  return (
+    modes.find((mode) => mode.value === (config.mode || config.costMode)) ||
+    modes[0] ||
+    fallbackModes[0]
+  )
 }
 
 function renderAccount(overview) {
@@ -279,8 +333,13 @@ function renderAccount(overview) {
 function renderConfig(overview) {
   const config = overview.config
   els.configModelAlias.value = config.modelAlias || ''
-  els.configAgentId.value = config.agentId || ''
-  const mode = config.costMode || 'free'
+  const mode = config.mode || config.costMode || 'free'
+  const modeDefinition = resolveModeDefinition(config)
+  populateModeDropdown(config.availableModes, mode)
+  els.configModeHelp.textContent =
+    modeDefinition?.description || '选择 Codebuff 模式；保存后会重建现有会话。'
+  els.configAgentId.textContent = config.agentId || modeDefinition?.agentId || '-'
+
   const availableModels = Array.isArray(config.availableBackendModels)
     ? config.availableBackendModels
     : (fallbackBackendModels[mode] ?? fallbackBackendModels.free)
@@ -289,7 +348,6 @@ function renderConfig(overview) {
     config.backendModel || availableModels[0]?.value || ''
 
   populateModelDropdown(availableModels, selectedBackendModel)
-  els.configCostMode.value = mode
 
   const modelAlias = config.modelAlias || 'freebuff-bridge'
   els.tutorialModelAlias.textContent = modelAlias
@@ -378,7 +436,7 @@ function renderSessions(overview) {
       <div><dt>请求数</dt><dd>${session.usage.requests}</dd></div>
       <div><dt>总 Tokens</dt><dd>${session.usage.totalTokens}</dd></div>
       <div><dt>绑定账号</dt><dd>${session.accountEmail || session.accountId || '-'}</dd></div>
-      <div><dt>计费模式</dt><dd>${session.costMode || 'free'}</dd></div>
+      <div><dt>模式</dt><dd>${session.costMode || 'free'}</dd></div>
       </div>
       <div class="muted">client_id: ${session.codebuffMetadata?.client_id || '-'}</div>
       <div class="muted">run_id: ${session.codebuffMetadata?.run_id || '-'}</div>
@@ -475,14 +533,27 @@ els.autoRefreshSelect.addEventListener('change', () => {
   showToast(seconds > 0 ? `已开启自动刷新（${seconds}s）` : '已关闭自动刷新')
 })
 
-els.configCostMode.addEventListener('change', async () => {
-  const mode = els.configCostMode.value
+els.configMode.addEventListener('change', async () => {
+  const selectedMode = els.configMode.value
+  const availableModes =
+    state.overview?.config?.availableModes || fallbackModes
+  const modeDefinition =
+    availableModes.find((mode) => mode.value === selectedMode) ||
+    fallbackModes.find((mode) => mode.value === selectedMode) ||
+    fallbackModes[0]
+  els.configModeHelp.textContent =
+    modeDefinition?.description || '选择 Codebuff 模式；保存后会重建现有会话。'
+  els.configAgentId.textContent = modeDefinition?.agentId || '-'
+
   try {
-    const res = await request(`/v1/freebuff/models?costMode=${mode}`)
+    const res = await request(`/v1/freebuff/models?mode=${selectedMode}`)
     const models = res.models ?? []
     populateModelDropdown(models, models[0]?.value ?? '')
   } catch (_) {
-    populateModelDropdown(fallbackBackendModels[mode] ?? fallbackBackendModels.free, '')
+    populateModelDropdown(
+      fallbackBackendModels[selectedMode] ?? fallbackBackendModels.free,
+      '',
+    )
   }
 })
 
@@ -578,9 +649,8 @@ els.configForm.addEventListener('submit', async (event) => {
         method: 'POST',
         body: JSON.stringify({
           modelAlias: els.configModelAlias.value,
-          agentId: els.configAgentId.value,
+          mode: els.configMode.value,
           backendModel: els.configBackendModel.value,
-          costMode: els.configCostMode.value,
         }),
       })
       await refreshOverview()
