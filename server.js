@@ -142,7 +142,14 @@ const sessionLocks = new Map()
 const bridgeSessions = new Map()
 const loginSessions = new Map()
 const usageRecords = []
+const accountRuntimeStats = new Map()
 let accountRotationCursor = 0
+
+const ACCOUNT_STATS_WINDOW = 5
+const ACCOUNT_COOLDOWN_MS = 45_000
+const ACCOUNT_SELECTION_RECENCY_MS = 12_000
+const ACCOUNT_SLOW_TPS_THRESHOLD = 8
+const ACCOUNT_SLOW_DURATION_MS = 7_500
 
 process.on('uncaughtException', (error) => {
   console.error('[freebuff-bridge] uncaughtException', error)
@@ -421,15 +428,275 @@ function listAvailableAccounts(excludedAccountIds = []) {
   )
 }
 
-function selectNextAccount(excludedAccountIds = []) {
-  const accounts = listAvailableAccounts(excludedAccountIds)
-  if (accounts.length === 0) {
+function pickRotatingItem(items) {
+  if (!Array.isArray(items) || items.length === 0) {
     return null
   }
 
-  const index = accountRotationCursor % accounts.length
-  accountRotationCursor = (accountRotationCursor + 1) % accounts.length
-  return accounts[index]
+  const index = accountRotationCursor % items.length
+  accountRotationCursor = (accountRotationCursor + 1) % items.length
+  return items[index]
+}
+
+function selectNextAccount(excludedAccountIds = []) {
+  return pickRotatingItem(listAvailableAccounts(excludedAccountIds))
+}
+
+function getOrCreateAccountRuntimeStats(accountId) {
+  if (!accountId) {
+    return null
+  }
+
+  let stats = accountRuntimeStats.get(accountId)
+  if (!stats) {
+    stats = {
+      recentSuccesses: [],
+      selectionCount: 0,
+      lastSelectedAtMs: 0,
+      lastSuccessAtMs: 0,
+      lastFailureAtMs: 0,
+      lastFailureReason: null,
+      cooldownUntilMs: 0,
+      consecutiveSlowCount: 0,
+    }
+    accountRuntimeStats.set(accountId, stats)
+  }
+
+  return stats
+}
+
+function removeAccountRuntimeStats(accountId) {
+  if (!accountId) {
+    return
+  }
+
+  accountRuntimeStats.delete(accountId)
+}
+
+function toRoundedTps(value) {
+  return Number.isFinite(value) ? Number(value.toFixed(1)) : 0
+}
+
+function buildAccountRuntimeSummary(accountId, now = Date.now()) {
+  const stats = accountRuntimeStats.get(accountId)
+  const successes = Array.isArray(stats?.recentSuccesses) ? stats.recentSuccesses : []
+  const sampleCount = successes.length
+  const avgTps =
+    sampleCount > 0
+      ? toRoundedTps(
+          successes.reduce((sum, item) => sum + (item.tps || 0), 0) / sampleCount,
+        )
+      : 0
+  const avgDurationMs =
+    sampleCount > 0
+      ? Math.round(
+          successes.reduce((sum, item) => sum + (item.durationMs || 0), 0) /
+            sampleCount,
+        )
+      : 0
+  const latest = successes[0] || null
+
+  return {
+    sampleCount,
+    avgTps,
+    avgDurationMs,
+    latestTps: latest ? toRoundedTps(latest.tps || 0) : 0,
+    latestDurationMs: latest?.durationMs || 0,
+    selectionCount: stats?.selectionCount || 0,
+    lastSelectedAt: stats?.lastSelectedAtMs
+      ? new Date(stats.lastSelectedAtMs).toISOString()
+      : null,
+    lastSelectedAtMs: stats?.lastSelectedAtMs || 0,
+    lastSuccessAt: stats?.lastSuccessAtMs
+      ? new Date(stats.lastSuccessAtMs).toISOString()
+      : null,
+    lastSuccessAtMs: stats?.lastSuccessAtMs || 0,
+    lastFailureAt: stats?.lastFailureAtMs
+      ? new Date(stats.lastFailureAtMs).toISOString()
+      : null,
+    lastFailureAtMs: stats?.lastFailureAtMs || 0,
+    lastFailureReason: stats?.lastFailureReason || null,
+    cooldownUntil:
+      stats?.cooldownUntilMs && stats.cooldownUntilMs > 0
+        ? new Date(stats.cooldownUntilMs).toISOString()
+        : null,
+    cooldownUntilMs: stats?.cooldownUntilMs || 0,
+    isCoolingDown: Boolean(stats?.cooldownUntilMs && stats.cooldownUntilMs > now),
+    consecutiveSlowCount: stats?.consecutiveSlowCount || 0,
+  }
+}
+
+function markAccountSelected(accountId, selectedAtMs = Date.now()) {
+  const stats = getOrCreateAccountRuntimeStats(accountId)
+  if (!stats) {
+    return
+  }
+
+  stats.selectionCount += 1
+  stats.lastSelectedAtMs = selectedAtMs
+}
+
+function markAccountSuccess(
+  accountId,
+  { durationMs = 0, outputTokens = 0, reason = 'success' } = {},
+) {
+  const stats = getOrCreateAccountRuntimeStats(accountId)
+  if (!stats) {
+    return buildAccountRuntimeSummary(accountId)
+  }
+
+  const now = Date.now()
+  const tps =
+    outputTokens > 0 && durationMs > 0 ? outputTokens / (durationMs / 1000) : 0
+  stats.recentSuccesses.unshift({
+    durationMs,
+    outputTokens,
+    tps,
+    reason,
+    createdAtMs: now,
+  })
+  if (stats.recentSuccesses.length > ACCOUNT_STATS_WINDOW) {
+    stats.recentSuccesses.length = ACCOUNT_STATS_WINDOW
+  }
+
+  stats.lastSuccessAtMs = now
+  stats.lastFailureReason = null
+  stats.cooldownUntilMs = 0
+  if (tps < ACCOUNT_SLOW_TPS_THRESHOLD || durationMs > ACCOUNT_SLOW_DURATION_MS) {
+    stats.consecutiveSlowCount += 1
+  } else {
+    stats.consecutiveSlowCount = 0
+  }
+
+  return buildAccountRuntimeSummary(accountId, now)
+}
+
+function markAccountFailure(
+  accountId,
+  reason = 'request_failed',
+  cooldownMs = ACCOUNT_COOLDOWN_MS,
+) {
+  const stats = getOrCreateAccountRuntimeStats(accountId)
+  if (!stats) {
+    return buildAccountRuntimeSummary(accountId)
+  }
+
+  const now = Date.now()
+  stats.lastFailureAtMs = now
+  stats.lastFailureReason = reason
+  stats.cooldownUntilMs = cooldownMs > 0 ? now + cooldownMs : 0
+
+  return buildAccountRuntimeSummary(accountId, now)
+}
+
+function describeSelectionReason(kind, account, summary) {
+  if (kind === 'cold_start') {
+    return `Cold-start sample for ${account.email || account.accountId}`
+  }
+
+  if (kind === 'retry') {
+    return `Retry on ${account.email || account.accountId}`
+  }
+
+  const pieces = []
+  if (summary.avgTps > 0) {
+    pieces.push(`avg ${summary.avgTps} t/s`)
+  }
+  if (summary.avgDurationMs > 0) {
+    pieces.push(`avg ${summary.avgDurationMs}ms`)
+  }
+  if (summary.consecutiveSlowCount > 0) {
+    pieces.push(`${summary.consecutiveSlowCount} slow streak`)
+  }
+  return pieces.length > 0
+    ? `Performance selection: ${pieces.join(', ')}`
+    : `Performance selection for ${account.email || account.accountId}`
+}
+
+function scoreAccountCandidate(summary, now) {
+  let score = summary.sampleCount > 0 ? summary.avgTps : -0.5
+  score -= summary.avgDurationMs / 10_000
+  score -= Math.min(summary.consecutiveSlowCount, 3) * 0.75
+
+  if (
+    summary.lastSelectedAtMs > 0 &&
+    now - summary.lastSelectedAtMs < ACCOUNT_SELECTION_RECENCY_MS
+  ) {
+    score -= 0.9
+  }
+
+  if (summary.isCoolingDown) {
+    score -= 4
+  }
+
+  if (
+    summary.lastFailureAtMs > 0 &&
+    now - summary.lastFailureAtMs < ACCOUNT_COOLDOWN_MS * 2
+  ) {
+    score -= 1.2
+  }
+
+  return Number(score.toFixed(3))
+}
+
+function selectAccountForRequest(session, excludedAccountIds = [], strategy = 'performance') {
+  const availableAccounts = listAvailableAccounts(excludedAccountIds)
+  if (availableAccounts.length === 0) {
+    return null
+  }
+
+  const now = Date.now()
+  const candidates = availableAccounts.map((account) => {
+    const summary = buildAccountRuntimeSummary(account.accountId, now)
+    return {
+      account,
+      summary,
+      score: scoreAccountCandidate(summary, now),
+    }
+  })
+
+  const activeCandidates = candidates.filter((candidate) => !candidate.summary.isCoolingDown)
+  const pool = activeCandidates.length > 0 ? activeCandidates : candidates
+  const coldStartCandidates = pool.filter(
+    (candidate) =>
+      candidate.summary.sampleCount === 0 && candidate.summary.lastSelectedAtMs === 0,
+  )
+
+  const previousAccount = getSessionBoundAccount(session)
+  if (coldStartCandidates.length > 0) {
+    const selected = pickRotatingItem(coldStartCandidates)
+    return {
+      account: selected.account,
+      previousAccountId: previousAccount?.accountId || null,
+      score: selected.score,
+      summary: selected.summary,
+      strategy,
+      reason: describeSelectionReason('cold_start', selected.account, selected.summary),
+    }
+  }
+
+  pool.sort((left, right) => {
+    if (right.score !== left.score) {
+      return right.score - left.score
+    }
+    if (right.summary.avgTps !== left.summary.avgTps) {
+      return right.summary.avgTps - left.summary.avgTps
+    }
+    if (left.summary.avgDurationMs !== right.summary.avgDurationMs) {
+      return left.summary.avgDurationMs - right.summary.avgDurationMs
+    }
+    return left.summary.lastSelectedAtMs - right.summary.lastSelectedAtMs
+  })
+
+  const selected = pool[0]
+  return {
+    account: selected.account,
+    previousAccountId: previousAccount?.accountId || null,
+    score: selected.score,
+    summary: selected.summary,
+    strategy,
+    reason: describeSelectionReason(strategy, selected.account, selected.summary),
+  }
 }
 
 function summarizeAuthPool(accounts = listAuthAccounts()) {
@@ -562,8 +829,9 @@ function bindSessionToAccount(session, account, reason = null) {
   }
 
   if (session.accountId !== account.accountId) {
-    resetSessionRunState(session, reason)
     session.accountId = account.accountId
+    session.lastAccountSwitchAt = new Date().toISOString()
+    session.lastAccountSwitchReason = reason
   }
 
   session.updatedAt = new Date().toISOString()
@@ -571,20 +839,28 @@ function bindSessionToAccount(session, account, reason = null) {
   return account
 }
 
-function ensureSessionAccount(session, excludedAccountIds = []) {
-  const current = getSessionBoundAccount(session)
-  if (current && !excludedAccountIds.includes(current.accountId)) {
-    return current
+async function assignSessionToAccount(session, account, reason = null) {
+  if (!session || !account) {
+    return {
+      account: null,
+      previousAccount: getSessionBoundAccount(session),
+      switched: false,
+    }
   }
 
-  const nextAccount = selectNextAccount(
-    [session?.accountId, ...excludedAccountIds].filter(Boolean),
-  )
-  if (!nextAccount) {
-    return null
+  const previousAccount = getSessionBoundAccount(session)
+  const switched = previousAccount?.accountId !== account.accountId
+  if (switched && previousAccount) {
+    await finishSessionRun(previousAccount.authToken, session, 'cancelled')
+    resetSessionRunState(session, reason || 'Account switched.')
   }
 
-  return bindSessionToAccount(session, nextAccount, 'Account binding refreshed.')
+  bindSessionToAccount(session, account, reason)
+  return {
+    account,
+    previousAccount,
+    switched,
+  }
 }
 
 async function releaseSessionsForAccount(accountId, status = 'cancelled') {
@@ -1036,21 +1312,43 @@ function sanitizeToolSchema(schema) {
 
   const allowedKeys = new Set([
     'type',
+    'title',
+    'description',
     'properties',
+    'patternProperties',
     'required',
     'items',
+    'prefixItems',
+    'contains',
     'additionalProperties',
+    'propertyNames',
+    'dependentRequired',
+    'dependentSchemas',
     'enum',
+    'const',
     'oneOf',
     'anyOf',
     'allOf',
+    'not',
+    '$ref',
+    '$defs',
+    'definitions',
     'minimum',
     'maximum',
+    'exclusiveMinimum',
+    'exclusiveMaximum',
+    'multipleOf',
     'minItems',
     'maxItems',
+    'uniqueItems',
+    'minContains',
+    'maxContains',
     'minLength',
     'maxLength',
+    'pattern',
     'default',
+    'examples',
+    'deprecated',
     'format',
     'nullable',
   ])
@@ -1063,6 +1361,24 @@ function sanitizeToolSchema(schema) {
 
     if (key === 'properties' && value && typeof value === 'object' && !Array.isArray(value)) {
       next.properties = Object.fromEntries(
+        Object.entries(value).map(([childKey, childValue]) => [
+          childKey,
+          sanitizeToolSchema(childValue),
+        ]),
+      )
+      continue
+    }
+
+    if (
+      (key === 'patternProperties' ||
+        key === '$defs' ||
+        key === 'definitions' ||
+        key === 'dependentSchemas') &&
+      value &&
+      typeof value === 'object' &&
+      !Array.isArray(value)
+    ) {
+      next[key] = Object.fromEntries(
         Object.entries(value).map(([childKey, childValue]) => [
           childKey,
           sanitizeToolSchema(childValue),
@@ -1087,6 +1403,84 @@ function normalizeToolSchemaMap(tools) {
   return map
 }
 
+function deepEqual(left, right) {
+  if (left === right) {
+    return true
+  }
+
+  if (typeof left !== typeof right) {
+    return false
+  }
+
+  if (Array.isArray(left) && Array.isArray(right)) {
+    if (left.length !== right.length) {
+      return false
+    }
+
+    return left.every((item, index) => deepEqual(item, right[index]))
+  }
+
+  if (
+    left &&
+    right &&
+    typeof left === 'object' &&
+    typeof right === 'object'
+  ) {
+    const leftKeys = Object.keys(left)
+    const rightKeys = Object.keys(right)
+    if (leftKeys.length !== rightKeys.length) {
+      return false
+    }
+
+    return leftKeys.every(
+      (key) => rightKeys.includes(key) && deepEqual(left[key], right[key]),
+    )
+  }
+
+  return false
+}
+
+function inferValueType(value) {
+  if (value === null) {
+    return 'null'
+  }
+  if (Array.isArray(value)) {
+    return 'array'
+  }
+  if (Number.isInteger(value)) {
+    return 'integer'
+  }
+  return typeof value
+}
+
+function matchesSchemaType(schemaType, value, nullable) {
+  if (value === null) {
+    return schemaType === 'null' || nullable === true
+  }
+
+  if (Array.isArray(schemaType)) {
+    return schemaType.some((item) => matchesSchemaType(item, value, nullable))
+  }
+
+  if (!schemaType) {
+    return true
+  }
+
+  if (schemaType === 'integer') {
+    return Number.isInteger(value)
+  }
+
+  if (schemaType === 'array') {
+    return Array.isArray(value)
+  }
+
+  if (schemaType === 'object') {
+    return typeof value === 'object' && value != null && !Array.isArray(value)
+  }
+
+  return typeof value === schemaType
+}
+
 function validateAgainstSchema(schema, value, path = []) {
   if (!schema || typeof schema !== 'object') {
     return []
@@ -1094,16 +1488,78 @@ function validateAgainstSchema(schema, value, path = []) {
 
   const errors = []
   const schemaType = schema.type
+  const nullable = schema.nullable === true
 
-  if (schemaType === 'object') {
-    if (typeof value !== 'object' || value == null || Array.isArray(value)) {
+  if (schema.const !== undefined && !deepEqual(value, schema.const)) {
+    errors.push({
+      path,
+      message: 'Value does not match const',
+    })
+    return errors
+  }
+
+  if (Array.isArray(schema.enum) && schema.enum.length > 0) {
+    const matchesEnum = schema.enum.some((item) => deepEqual(item, value))
+    if (!matchesEnum) {
       errors.push({
         path,
-        message: 'Expected object',
+        message: 'Value is not in enum',
       })
       return errors
     }
+  }
 
+  if (Array.isArray(schema.allOf) && schema.allOf.length > 0) {
+    for (const childSchema of schema.allOf) {
+      errors.push(...validateAgainstSchema(childSchema, value, path))
+    }
+  }
+
+  if (Array.isArray(schema.anyOf) && schema.anyOf.length > 0) {
+    const matchesAny = schema.anyOf.some(
+      (childSchema) => validateAgainstSchema(childSchema, value, path).length === 0,
+    )
+    if (!matchesAny) {
+      errors.push({
+        path,
+        message: 'Value does not satisfy anyOf',
+      })
+      return errors
+    }
+  }
+
+  if (Array.isArray(schema.oneOf) && schema.oneOf.length > 0) {
+    const matchesOne = schema.oneOf.filter(
+      (childSchema) => validateAgainstSchema(childSchema, value, path).length === 0,
+    ).length
+    if (matchesOne !== 1) {
+      errors.push({
+        path,
+        message: 'Value does not satisfy exactly one branch of oneOf',
+      })
+      return errors
+    }
+  }
+
+  if (schema.not && validateAgainstSchema(schema.not, value, path).length === 0) {
+    errors.push({
+      path,
+      message: 'Value matches forbidden schema',
+    })
+    return errors
+  }
+
+  if (!matchesSchemaType(schemaType, value, nullable)) {
+    errors.push({
+      path,
+      message: `Expected ${Array.isArray(schemaType) ? schemaType.join('|') : schemaType || inferValueType(value)}`,
+    })
+    return errors
+  }
+
+  const valueType = inferValueType(value)
+
+  if (valueType === 'object') {
     const required = Array.isArray(schema.required) ? schema.required : []
     for (const key of required) {
       if (!(key in value)) {
@@ -1118,38 +1574,235 @@ function validateAgainstSchema(schema, value, path = []) {
       schema.properties && typeof schema.properties === 'object'
         ? schema.properties
         : {}
+    const patternProperties =
+      schema.patternProperties && typeof schema.patternProperties === 'object'
+        ? schema.patternProperties
+        : {}
+    const knownKeys = new Set(Object.keys(properties))
+
     for (const [key, childSchema] of Object.entries(properties)) {
       if (key in value) {
         errors.push(...validateAgainstSchema(childSchema, value[key], [...path, key]))
       }
     }
+
+    for (const [pattern, childSchema] of Object.entries(patternProperties)) {
+      const regex = new RegExp(pattern)
+      for (const [key, childValue] of Object.entries(value)) {
+        if (regex.test(key)) {
+          knownKeys.add(key)
+          errors.push(...validateAgainstSchema(childSchema, childValue, [...path, key]))
+        }
+      }
+    }
+
+    if (schema.propertyNames && typeof schema.propertyNames === 'object') {
+      for (const key of Object.keys(value)) {
+        errors.push(
+          ...validateAgainstSchema(schema.propertyNames, key, [...path, key]),
+        )
+      }
+    }
+
+    if (schema.additionalProperties === false) {
+      for (const key of Object.keys(value)) {
+        if (!knownKeys.has(key)) {
+          errors.push({
+            path: [...path, key],
+            message: 'Unexpected property',
+          })
+        }
+      }
+    } else if (
+      schema.additionalProperties &&
+      typeof schema.additionalProperties === 'object'
+    ) {
+      for (const [key, childValue] of Object.entries(value)) {
+        if (!knownKeys.has(key)) {
+          errors.push(
+            ...validateAgainstSchema(
+              schema.additionalProperties,
+              childValue,
+              [...path, key],
+            ),
+          )
+        }
+      }
+    }
+
+    if (
+      schema.dependentRequired &&
+      typeof schema.dependentRequired === 'object' &&
+      !Array.isArray(schema.dependentRequired)
+    ) {
+      for (const [key, dependencies] of Object.entries(schema.dependentRequired)) {
+        if (!(key in value) || !Array.isArray(dependencies)) {
+          continue
+        }
+        for (const dependency of dependencies) {
+          if (!(dependency in value)) {
+            errors.push({
+              path: [...path, dependency],
+              message: `Missing dependent property for ${key}`,
+            })
+          }
+        }
+      }
+    }
+
+    if (
+      schema.dependentSchemas &&
+      typeof schema.dependentSchemas === 'object' &&
+      !Array.isArray(schema.dependentSchemas)
+    ) {
+      for (const [key, dependentSchema] of Object.entries(schema.dependentSchemas)) {
+        if (key in value) {
+          errors.push(...validateAgainstSchema(dependentSchema, value, path))
+        }
+      }
+    }
+
     return errors
   }
 
-  if (schemaType === 'array') {
-    if (!Array.isArray(value)) {
+  if (valueType === 'array') {
+    if (
+      typeof schema.minItems === 'number' &&
+      value.length < schema.minItems
+    ) {
       errors.push({
         path,
-        message: 'Expected array',
+        message: `Expected at least ${schema.minItems} item(s)`,
       })
-      return errors
     }
+
+    if (
+      typeof schema.maxItems === 'number' &&
+      value.length > schema.maxItems
+    ) {
+      errors.push({
+        path,
+        message: `Expected at most ${schema.maxItems} item(s)`,
+      })
+    }
+
+    if (schema.uniqueItems === true) {
+      const seen = new Set()
+      for (const item of value) {
+        const serialized = JSON.stringify(item)
+        if (seen.has(serialized)) {
+          errors.push({
+            path,
+            message: 'Expected unique items',
+          })
+          break
+        }
+        seen.add(serialized)
+      }
+    }
+
+    if (Array.isArray(schema.prefixItems) && schema.prefixItems.length > 0) {
+      schema.prefixItems.forEach((childSchema, index) => {
+        if (index < value.length) {
+          errors.push(...validateAgainstSchema(childSchema, value[index], [...path, index]))
+        }
+      })
+    }
+
     if (schema.items && typeof schema.items === 'object') {
       value.forEach((item, index) => {
         errors.push(...validateAgainstSchema(schema.items, item, [...path, index]))
       })
     }
+
+    if (schema.contains && typeof schema.contains === 'object') {
+      const matchingCount = value.filter(
+        (item, index) =>
+          validateAgainstSchema(schema.contains, item, [...path, index]).length === 0,
+      ).length
+      if (
+        typeof schema.minContains === 'number' &&
+        matchingCount < schema.minContains
+      ) {
+        errors.push({
+          path,
+          message: `Expected at least ${schema.minContains} matching item(s)`,
+        })
+      }
+      if (
+        typeof schema.maxContains === 'number' &&
+        matchingCount > schema.maxContains
+      ) {
+        errors.push({
+          path,
+          message: `Expected at most ${schema.maxContains} matching item(s)`,
+        })
+      }
+      if (
+        schema.minContains == null &&
+        schema.maxContains == null &&
+        matchingCount === 0
+      ) {
+        errors.push({
+          path,
+          message: 'Expected at least one matching item',
+        })
+      }
+    }
     return errors
   }
 
-  if (schemaType === 'string' && typeof value !== 'string') {
-    errors.push({ path, message: 'Expected string' })
-  } else if (schemaType === 'number' && typeof value !== 'number') {
-    errors.push({ path, message: 'Expected number' })
-  } else if (schemaType === 'integer' && !Number.isInteger(value)) {
-    errors.push({ path, message: 'Expected integer' })
-  } else if (schemaType === 'boolean' && typeof value !== 'boolean') {
-    errors.push({ path, message: 'Expected boolean' })
+  if (valueType === 'string') {
+    if (
+      typeof schema.minLength === 'number' &&
+      value.length < schema.minLength
+    ) {
+      errors.push({ path, message: `Expected at least ${schema.minLength} character(s)` })
+    }
+    if (
+      typeof schema.maxLength === 'number' &&
+      value.length > schema.maxLength
+    ) {
+      errors.push({ path, message: `Expected at most ${schema.maxLength} character(s)` })
+    }
+    if (typeof schema.pattern === 'string') {
+      const regex = new RegExp(schema.pattern)
+      if (!regex.test(value)) {
+        errors.push({ path, message: 'Value does not match pattern' })
+      }
+    }
+  } else if (valueType === 'number' || valueType === 'integer') {
+    if (
+      typeof schema.minimum === 'number' &&
+      value < schema.minimum
+    ) {
+      errors.push({ path, message: `Expected minimum ${schema.minimum}` })
+    }
+    if (
+      typeof schema.maximum === 'number' &&
+      value > schema.maximum
+    ) {
+      errors.push({ path, message: `Expected maximum ${schema.maximum}` })
+    }
+    if (
+      typeof schema.exclusiveMinimum === 'number' &&
+      value <= schema.exclusiveMinimum
+    ) {
+      errors.push({ path, message: `Expected greater than ${schema.exclusiveMinimum}` })
+    }
+    if (
+      typeof schema.exclusiveMaximum === 'number' &&
+      value >= schema.exclusiveMaximum
+    ) {
+      errors.push({ path, message: `Expected less than ${schema.exclusiveMaximum}` })
+    }
+    if (
+      typeof schema.multipleOf === 'number' &&
+      schema.multipleOf !== 0 &&
+      value % schema.multipleOf !== 0
+    ) {
+      errors.push({ path, message: `Expected multiple of ${schema.multipleOf}` })
+    }
   }
 
   return errors
@@ -1285,6 +1938,8 @@ function createBridgeSession(sessionName) {
     updatedAt: now,
     lastStopReason: null,
     lastError: null,
+    lastAccountSwitchAt: null,
+    lastAccountSwitchReason: null,
   }
 }
 
@@ -1321,6 +1976,8 @@ function inspectBridgeSession(sessionName) {
       accountId: null,
       accountEmail: null,
       accountSource: null,
+      lastAccountSwitchAt: null,
+      lastAccountSwitchReason: null,
     }
   }
 
@@ -1336,6 +1993,8 @@ function inspectBridgeSession(sessionName) {
     updatedAt: session.updatedAt,
     lastStopReason: session.lastStopReason,
     lastError: session.lastError,
+    lastAccountSwitchAt: session.lastAccountSwitchAt,
+    lastAccountSwitchReason: session.lastAccountSwitchReason,
     ...getAccountPresentation(account),
   }
 }
@@ -1413,6 +2072,8 @@ function listSessions() {
             toolCount: 0,
           },
         costMode: session?.costMode || runtimeConfig.costMode,
+        lastAccountSwitchAt: session?.lastAccountSwitchAt || null,
+        lastAccountSwitchReason: session?.lastAccountSwitchReason || null,
         ...getAccountPresentation(account),
       }
     })
@@ -1458,6 +2119,7 @@ async function buildAdminOverview() {
       environmentAccountPresent: auth.environmentAccountPresent,
     },
     accounts: accounts.map((account) => ({
+      ...buildAccountRuntimeSummary(account.accountId),
       accountId: account.accountId,
       email: account.email,
       source: account.source,
@@ -1601,6 +2263,14 @@ function isAuthenticationFailure(error) {
   return error?.statusCode === 401 || error?.statusCode === 403
 }
 
+function isRetryableAccountFailure(error) {
+  return (
+    isAuthenticationFailure(error) ||
+    error?.statusCode === 429 ||
+    (typeof error?.statusCode === 'number' && error.statusCode >= 500)
+  )
+}
+
 function createMissingCredentialsError() {
   return Object.assign(
     new Error(
@@ -1622,10 +2292,12 @@ async function repairToolUse({
   const repairPrompt = [
     'You are repairing an invalid tool call.',
     'Return ONLY one tool call for the specified tool.',
+    'The repaired arguments MUST exactly satisfy the provided JSON schema.',
     'Fill every required parameter from the conversation context.',
     'Do not omit required fields.',
     '',
     `Tool name: ${tool.name}`,
+    `Tool schema: ${JSON.stringify(tool.input_schema || {})}`,
     `Previous invalid input: ${JSON.stringify(invalidToolUse.input || {})}`,
     `Conversation messages: ${JSON.stringify(messages)}`,
   ].join('\n')
@@ -1798,12 +2470,19 @@ async function executeAnthropicRequest({ sessionName, body, headers, url }) {
       tool_choice: openAIToolChoice,
     }
 
-    const executeWithAccount = async (account) => {
+    const executeWithSelection = async (selection) => {
+      const { account, reason, score, previousAccountId } = selection
       if (!account?.authToken) {
         throw createMissingCredentialsError()
       }
 
-      bindSessionToAccount(session, account)
+      markAccountSelected(account.accountId)
+      const { previousAccount, switched } = await assignSessionToAccount(
+        session,
+        account,
+        reason,
+      )
+      const accountAttemptStartedAt = Date.now()
 
       const response = await executeCodebuffChatCompletion({
         token: account.authToken,
@@ -1836,6 +2515,12 @@ async function executeAnthropicRequest({ sessionName, body, headers, url }) {
         .filter((block) => block.type === 'text')
         .map((block) => block.text)
         .join('\n')
+      const accountDurationMs = Date.now() - accountAttemptStartedAt
+      const runtimeSummary = markAccountSuccess(account.accountId, {
+        durationMs: accountDurationMs,
+        outputTokens: anthropicMessage.usage.output_tokens,
+        reason: anthropicMessage.stop_reason,
+      })
 
       session.requestCount += 1
       session.turns += 1
@@ -1861,6 +2546,7 @@ async function executeAnthropicRequest({ sessionName, body, headers, url }) {
         promptChars: promptText.length,
         outputChars: responseText.length,
         durationMs: Date.now() - requestStartedAt,
+        accountDurationMs,
         codebuffMetadata: buildCodebuffMetadata(session),
         stopReason: anthropicMessage.stop_reason,
         toolCount: toolSummary.toolCount,
@@ -1869,30 +2555,49 @@ async function executeAnthropicRequest({ sessionName, body, headers, url }) {
           repairResult.repairedCount > 0
             ? `Repaired ${repairResult.repairedCount} invalid tool call(s)`
             : null,
+        previousAccountId: previousAccount?.accountId || previousAccountId,
+        previousAccountEmail: previousAccount?.email || null,
+        accountSwitched: switched,
+        accountSelectionReason: reason,
+        accountSelectionScore: score,
+        accountSampleCount: runtimeSummary.sampleCount,
+        accountTpsSnapshot: runtimeSummary.avgTps,
+        accountAvgDurationMs: runtimeSummary.avgDurationMs,
         ...getAccountPresentation(account),
       })
 
       return anthropicMessage
     }
 
-    const account = ensureSessionAccount(session)
-    if (!account) {
+    const selection = selectAccountForRequest(session)
+    if (!selection?.account) {
       throw createMissingCredentialsError()
     }
 
     try {
-      return await executeWithAccount(account)
+      return await executeWithSelection(selection)
     } catch (error) {
-      if (!isAuthenticationFailure(error)) {
+      session.lastError = error?.message || 'Unknown account execution error.'
+      bridgeSessions.set(sessionName, session)
+
+      if (!isRetryableAccountFailure(error)) {
         throw error
       }
 
-      const retryAccount = ensureSessionAccount(session, [account.accountId])
-      if (!retryAccount) {
+      markAccountFailure(
+        selection.account.accountId,
+        `http_${error?.statusCode || 'error'}`,
+      )
+      const retrySelection = selectAccountForRequest(
+        session,
+        [selection.account.accountId],
+        'retry',
+      )
+      if (!retrySelection?.account) {
         throw error
       }
 
-      return executeWithAccount(retryAccount)
+      return executeWithSelection(retrySelection)
     }
   })
 }
@@ -1921,12 +2626,19 @@ async function executeOpenAIRequest({ sessionName, body, headers }) {
       codebuff_metadata: undefined,
     }
 
-    const executeWithAccount = async (account) => {
+    const executeWithSelection = async (selection) => {
+      const { account, reason, score, previousAccountId } = selection
       if (!account?.authToken) {
         throw createMissingCredentialsError()
       }
 
-      bindSessionToAccount(session, account)
+      markAccountSelected(account.accountId)
+      const { previousAccount, switched } = await assignSessionToAccount(
+        session,
+        account,
+        reason,
+      )
+      const accountAttemptStartedAt = Date.now()
 
       const response = await executeCodebuffChatCompletion({
         token: account.authToken,
@@ -1936,6 +2648,12 @@ async function executeOpenAIRequest({ sessionName, body, headers }) {
 
       const usage = response.data?.usage || {}
       const toolCalls = response.data?.choices?.[0]?.message?.tool_calls || []
+      const accountDurationMs = Date.now() - accountAttemptStartedAt
+      const runtimeSummary = markAccountSuccess(account.accountId, {
+        durationMs: accountDurationMs,
+        outputTokens: usage.completion_tokens || 0,
+        reason: response.data?.choices?.[0]?.finish_reason || 'stop',
+      })
       session.requestCount += 1
       session.turns += 1
       session.updatedAt = new Date().toISOString()
@@ -1961,35 +2679,55 @@ async function executeOpenAIRequest({ sessionName, body, headers }) {
           response.data?.choices?.[0]?.message?.content,
         ).length,
         durationMs: Date.now() - requestStartedAt,
+        accountDurationMs,
         codebuffMetadata: buildCodebuffMetadata(session),
         stopReason: response.data?.choices?.[0]?.finish_reason || 'stop',
         toolCount: Array.isArray(toolCalls) ? toolCalls.length : 0,
         toolSources: [],
         errorSummary: null,
+        previousAccountId: previousAccount?.accountId || previousAccountId,
+        previousAccountEmail: previousAccount?.email || null,
+        accountSwitched: switched,
+        accountSelectionReason: reason,
+        accountSelectionScore: score,
+        accountSampleCount: runtimeSummary.sampleCount,
+        accountTpsSnapshot: runtimeSummary.avgTps,
+        accountAvgDurationMs: runtimeSummary.avgDurationMs,
         ...getAccountPresentation(account),
       })
 
       return buildCompletionResponse(publicModel, response.data)
     }
 
-    const account = ensureSessionAccount(session)
-    if (!account) {
+    const selection = selectAccountForRequest(session)
+    if (!selection?.account) {
       throw createMissingCredentialsError()
     }
 
     try {
-      return await executeWithAccount(account)
+      return await executeWithSelection(selection)
     } catch (error) {
-      if (!isAuthenticationFailure(error)) {
+      session.lastError = error?.message || 'Unknown account execution error.'
+      bridgeSessions.set(sessionName, session)
+
+      if (!isRetryableAccountFailure(error)) {
         throw error
       }
 
-      const retryAccount = ensureSessionAccount(session, [account.accountId])
-      if (!retryAccount) {
+      markAccountFailure(
+        selection.account.accountId,
+        `http_${error?.statusCode || 'error'}`,
+      )
+      const retrySelection = selectAccountForRequest(
+        session,
+        [selection.account.accountId],
+        'retry',
+      )
+      if (!retrySelection?.account) {
         throw error
       }
 
-      return executeWithAccount(retryAccount)
+      return executeWithSelection(retrySelection)
     }
   })
 }
@@ -2389,6 +3127,7 @@ const server = createServer(async (req, res) => {
       await releaseSessionsForAccount(accountId, 'cancelled')
       clearLoginSessionsForAccount(accountId)
       removeStoredAccount(accountId)
+      removeAccountRuntimeStats(accountId)
       sendJson(res, 200, {
         ok: true,
         loggedOut: true,
@@ -2402,6 +3141,7 @@ const server = createServer(async (req, res) => {
       bridgeSessions.clear()
       loginSessions.clear()
       writeStoredAccounts([])
+      accountRuntimeStats.clear()
       sendJson(res, 200, { ok: true, loggedOutAll: true })
       return
     }

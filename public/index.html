@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Freebuff 桥接控制台</title>
+    <title>Codebuff 桥接控制台</title>
     <link rel="stylesheet" href="/app.css" />
   </head>
   <body>
@@ -12,7 +12,7 @@
       <header class="hero">
         <div>
           <p class="eyebrow">本地管理面板</p>
-          <h1>Freebuff 桥接控制台</h1>
+          <h1>Codebuff 桥接控制台</h1>
           <p class="hero-copy">
             统一管理账号状态、运行模型配置、会话状态和 Token 使用记录。
           </p>
@@ -158,7 +158,7 @@ npm start</code></pre>
               <p class="callout-title">2. 给 Claude Code 配环境变量</p>
               <pre class="code-block"><code>export ANTHROPIC_BASE_URL=http://127.0.0.1:8765
 export ANTHROPIC_API_KEY=dummy</code></pre>
-              <p class="muted">`ANTHROPIC_API_KEY` 这里只是占位，真正鉴权走本地 Freebuff/Codebuff 凭据。</p>
+              <p class="muted">`ANTHROPIC_API_KEY` 这里只是占位，真正鉴权走本地 Codebuff 凭据。</p>
             </div>
 
             <div class="callout">
@@ -175,13 +175,13 @@ export ANTHROPIC_API_KEY=dummy</code></pre>
 
             <div class="callout">
               <p class="callout-title">5. 第一次使用前先确认登录</p>
-              <p class="muted">如果上面的账号区域还没有可用账号，先点"新增登录账号"，浏览器完成 Freebuff 官方登录后，再点"检查登录状态"。</p>
+              <p class="muted">如果上面的账号区域还没有可用账号，先点"新增登录账号"，浏览器完成 Codebuff 官方登录后，再点"检查登录状态"。</p>
             </div>
 
             <div class="callout">
               <p class="callout-title">6. 验证是否接通</p>
               <pre class="code-block"><code>curl http://127.0.0.1:8765/health</code></pre>
-              <p class="muted">只要 `authenticated: true`，Claude Code 就可以通过这个桥使用 Freebuff 侧能力。</p>
+              <p class="muted">只要 `authenticated: true`，Claude Code 就可以通过这个桥使用 Codebuff 侧能力。</p>
             </div>
           </div>
         </article>

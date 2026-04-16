@@ -169,6 +169,24 @@ function formatDate(value) {
   return date.toLocaleString()
 }
 
+function formatCooldown(value) {
+  if (!value) {
+    return '-'
+  }
+
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return '-'
+  }
+
+  const remainingMs = date.getTime() - Date.now()
+  if (remainingMs <= 0) {
+    return '就绪'
+  }
+
+  return `${Math.ceil(remainingMs / 1000)}s`
+}
+
 function formatAccountName(account) {
   if (!account) {
     return '-'
@@ -269,7 +287,7 @@ function renderAccount(overview) {
   } else {
     els.loginUrlBox.innerHTML = `
       <div class="callout">
-        <p class="muted" style="margin: 0;">点击新增登录账号后会生成官方 Freebuff 登录地址，可连续加入多个账号。</p>
+        <p class="muted" style="margin: 0;">点击新增登录账号后会生成官方 Codebuff 登录地址，可连续加入多个账号。</p>
       </div>`
     els.loginActions.innerHTML = `
       <div class="button-row">
@@ -287,7 +305,7 @@ function renderAccount(overview) {
     <div class="account-pool-head">
       <div>
         <p class="label">账号池</p>
-        <p class="muted" style="margin: 0;">新会话按轮训挑选账号；这里只保留紧凑列表，不再展开大卡片。</p>
+        <p class="muted" style="margin: 0;">每次请求都会按最近性能重选账号，优先最近 TPS 更高的账号。</p>
       </div>
     </div>
     <div class="table-wrap account-table-wrap">
@@ -296,9 +314,10 @@ function renderAccount(overview) {
           <tr>
             <th>账号</th>
             <th>来源</th>
-            <th>轮训</th>
-            <th>绑定</th>
-            <th>更新时间</th>
+            <th>最近 TPS</th>
+            <th>平均延迟</th>
+            <th>状态</th>
+            <th>最近会话</th>
             <th>操作</th>
           </tr>
         </thead>
@@ -312,9 +331,16 @@ function renderAccount(overview) {
                     <div class="account-subline">${account.accountId}</div>
                   </td>
                   <td>${account.source || '-'}</td>
-                  <td>${account.inPool ? accountStatusPill('参与中', 'ok') : accountStatusPill('已停用', 'warn')}</td>
+                  <td>${account.avgTps ? `${account.avgTps} t/s` : '-'}</td>
+                  <td>${account.avgDurationMs ? formatDuration(account.avgDurationMs) : '-'}</td>
+                  <td>${
+                    !account.inPool
+                      ? accountStatusPill('停用', 'warn')
+                      : account.isCoolingDown
+                        ? accountStatusPill(`冷却 ${formatCooldown(account.cooldownUntil)}`, 'warn')
+                        : accountStatusPill('就绪', 'ok')
+                  }</td>
                   <td>${account.boundSessionCount || 0}</td>
-                  <td>${formatDate(account.updatedAt)}</td>
                   <td class="account-action-cell">
                     ${
                       account.readOnly
@@ -435,9 +461,11 @@ function renderSessions(overview) {
       <div><dt>轮次</dt><dd>${session.turns}</dd></div>
       <div><dt>请求数</dt><dd>${session.usage.requests}</dd></div>
       <div><dt>总 Tokens</dt><dd>${session.usage.totalTokens}</dd></div>
-      <div><dt>绑定账号</dt><dd>${session.accountEmail || session.accountId || '-'}</dd></div>
+      <div><dt>最近账号</dt><dd>${session.accountEmail || session.accountId || '-'}</dd></div>
       <div><dt>模式</dt><dd>${session.costMode || 'free'}</dd></div>
       </div>
+      <div class="muted">最近切换: ${formatDate(session.lastAccountSwitchAt)}</div>
+      <div class="muted">切换原因: ${session.lastAccountSwitchReason || '-'}</div>
       <div class="muted">client_id: ${session.codebuffMetadata?.client_id || '-'}</div>
       <div class="muted">run_id: ${session.codebuffMetadata?.run_id || '-'}</div>
     `
