@@ -2184,6 +2184,48 @@ async function callCodebuffJson(token, pathname, body) {
   })
 }
 
+async function callCodebuffStreamRaw(token, body) {
+  return fetch(`${CONFIG.apiBaseUrl}/api/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      Authorization: `Bearer ${token}`,
+      'x-codebuff-api-key': token,
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(CONFIG.responseTimeoutMs),
+  })
+}
+
+async function* readOpenAISseStream(response) {
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      const lines = buf.split('\n')
+      buf = lines.pop()
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue
+        const data = line.slice(5).trim()
+        if (data === '[DONE]') return
+        try { yield JSON.parse(data) } catch {}
+      }
+    }
+  } finally {
+    reader.cancel().catch(() => {})
+  }
+}
+
+function mapOpenAIFinishReason(reason) {
+  if (reason === 'tool_calls') return 'tool_use'
+  if (reason === 'length') return 'max_tokens'
+  return 'end_turn'
+}
+
 async function startAgentRun(token, agentId) {
   const response = await callCodebuffJson(token, '/api/v1/agent-runs', {
     action: 'START',
@@ -2436,6 +2478,262 @@ function summarizeAnthropicTools(tools) {
     toolCount: tools.length,
     toolSources: Array.from(sources),
   }
+}
+
+async function streamAnthropicRequest(res, { sessionName, body, headers, url }) {
+  return withSessionLock(sessionName, async () => {
+    if (shouldResetSession(body, headers)) {
+      const previous = bridgeSessions.get(sessionName)
+      const previousAccount = getSessionBoundAccount(previous)
+      await finishSessionRun(previousAccount?.authToken, previous, 'cancelled')
+      bridgeSessions.delete(sessionName)
+    }
+
+    const session = getOrCreateBridgeSession(sessionName)
+    const requestStartedAt = Date.now()
+    const publicModel = body.model || runtimeConfig.modelAlias
+    const openAIMessages = convertAnthropicMessagesToOpenAIMessages(body.messages, body.system)
+    const openAITools = convertAnthropicToolsToOpenAITools(body.tools)
+    const openAIToolChoice = convertAnthropicToolChoiceToOpenAI(body.tool_choice)
+    const upstreamBodyBase = {
+      model: runtimeConfig.backendModel,
+      stream: true,
+      messages: openAIMessages,
+      max_tokens: body.max_tokens,
+      temperature: body.temperature,
+      stop: body.stop_sequences,
+      provider: { data_collection: 'deny' },
+      tools: openAITools || [],
+      tool_choice: openAIToolChoice,
+    }
+
+    const acquireUpstream = async (token, forSession) => {
+      await ensureActiveRun(token, forSession)
+      const rawBody = { ...upstreamBodyBase, codebuff_metadata: buildCodebuffMetadata(forSession) }
+      let upstream = await callCodebuffStreamRaw(token, rawBody)
+      if (!upstream.ok) {
+        const text = await upstream.text()
+        let data = null
+        try { data = JSON.parse(text) } catch {}
+        if (isInvalidRunError({ data, text })) {
+          await finishSessionRun(token, forSession, 'cancelled')
+          forSession.runId = await startAgentRun(token, forSession.agentId)
+          forSession.updatedAt = new Date().toISOString()
+          bridgeSessions.set(sessionName, forSession)
+          upstream = await callCodebuffStreamRaw(token, {
+            ...rawBody,
+            codebuff_metadata: buildCodebuffMetadata(forSession),
+          })
+        }
+        if (!upstream.ok) {
+          const errText = upstream.bodyUsed ? text : await upstream.text()
+          let errData = null
+          try { errData = JSON.parse(errText) } catch {}
+          throw Object.assign(
+            new Error(errData?.error || errData?.message || errText || 'Codebuff completion failed.'),
+            { statusCode: upstream.status || 500 },
+          )
+        }
+      }
+      return upstream
+    }
+
+    const selection = selectAccountForRequest(session)
+    if (!selection?.account) throw createMissingCredentialsError()
+    const { score } = selection
+    let { account, reason } = selection
+    let activePreviousAccountId = null
+
+    markAccountSelected(account.accountId)
+    let { previousAccount, switched } = await assignSessionToAccount(session, account, reason)
+    const accountAttemptStartedAt = Date.now()
+
+    let upstream
+    try {
+      upstream = await acquireUpstream(account.authToken, session)
+    } catch (error) {
+      session.lastError = error?.message || 'Unknown error'
+      bridgeSessions.set(sessionName, session)
+      if (!isRetryableAccountFailure(error)) throw error
+      markAccountFailure(account.accountId, `http_${error?.statusCode || 'error'}`)
+      const retrySelection = selectAccountForRequest(session, [account.accountId], 'retry')
+      if (!retrySelection?.account) throw error
+      activePreviousAccountId = account.accountId
+      account = retrySelection.account
+      reason = retrySelection.reason
+      markAccountSelected(account.accountId)
+      ;({ previousAccount, switched } = await assignSessionToAccount(session, account, reason))
+      upstream = await acquireUpstream(account.authToken, session)
+    }
+
+    // Headers are confirmed OK — start writing SSE to client
+    const msgId = `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+    })
+    const writeEvent = (event, payload) => {
+      const ok = res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`)
+      if (!ok) return new Promise(resolve => res.once('drain', resolve))
+    }
+
+    await writeEvent('message_start', {
+      type: 'message_start',
+      message: {
+        id: msgId, type: 'message', role: 'assistant', model: publicModel,
+        content: [], stop_reason: null, stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    })
+
+    let blockIdx = 0
+    let textIdx = -1
+    let textBuf = ''
+    const toolBlocks = new Map() // openAI tool index → { anthropicIdx, id, name, argsBuf }
+    let stopReason = 'end_turn'
+    let inputTokens = 0
+    let outputTokens = 0
+
+    for await (const chunk of readOpenAISseStream(upstream)) {
+      const choice = chunk.choices?.[0]
+      const delta = choice?.delta
+      if (chunk.usage) {
+        inputTokens = chunk.usage.prompt_tokens || 0
+        outputTokens = chunk.usage.completion_tokens || 0
+      }
+      if (choice?.finish_reason) stopReason = mapOpenAIFinishReason(choice.finish_reason)
+      if (!delta) continue
+
+      if (typeof delta.content === 'string' && delta.content !== '') {
+        if (textIdx === -1) {
+          textIdx = blockIdx++
+          await writeEvent('content_block_start', {
+            type: 'content_block_start', index: textIdx,
+            content_block: { type: 'text', text: '' },
+          })
+        }
+        textBuf += delta.content
+        await writeEvent('content_block_delta', {
+          type: 'content_block_delta', index: textIdx,
+          delta: { type: 'text_delta', text: delta.content },
+        })
+      }
+
+      if (Array.isArray(delta.tool_calls)) {
+        for (const tc of delta.tool_calls) {
+          const ti = tc.index
+          if (!toolBlocks.has(ti)) toolBlocks.set(ti, { anthropicIdx: blockIdx++, id: '', name: '', argsBuf: '' })
+          const blk = toolBlocks.get(ti)
+          if (tc.id) blk.id = tc.id
+          if (tc.function?.name) blk.name += tc.function.name
+          if (tc.function?.arguments) blk.argsBuf += tc.function.arguments
+        }
+      }
+    }
+
+    if (textIdx !== -1) {
+      await writeEvent('content_block_stop', { type: 'content_block_stop', index: textIdx })
+    }
+
+    // Reconstruct full anthropicMessage for repair check
+    const anthropicContent = []
+    if (textIdx !== -1) anthropicContent[textIdx] = { type: 'text', text: textBuf }
+    for (const [, blk] of toolBlocks) {
+      let parsedInput = {}
+      try { parsedInput = JSON.parse(blk.argsBuf || '{}') } catch {}
+      anthropicContent[blk.anthropicIdx] = { type: 'tool_use', id: blk.id, name: blk.name, input: parsedInput }
+    }
+
+    const anthropicMessage = {
+      id: msgId, type: 'message', role: 'assistant', model: publicModel,
+      content: anthropicContent.filter(Boolean),
+      stop_reason: stopReason, stop_sequence: null,
+      usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+    }
+
+    const repairResult = await repairInvalidToolUses({
+      token: account.authToken, session, publicModel,
+      system: body.system, messages: body.messages, tools: body.tools, anthropicMessage,
+    })
+
+    for (const [, blk] of toolBlocks) {
+      const finalBlock = repairResult.message.content.find(c => c.type === 'tool_use' && c.id === blk.id)
+        || { id: blk.id, name: blk.name, input: {} }
+      await writeEvent('content_block_start', {
+        type: 'content_block_start', index: blk.anthropicIdx,
+        content_block: { type: 'tool_use', id: finalBlock.id, name: finalBlock.name, input: {} },
+      })
+      await writeEvent('content_block_delta', {
+        type: 'content_block_delta', index: blk.anthropicIdx,
+        delta: { type: 'input_json_delta', partial_json: JSON.stringify(finalBlock.input || {}) },
+      })
+      await writeEvent('content_block_stop', { type: 'content_block_stop', index: blk.anthropicIdx })
+    }
+
+    await writeEvent('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: { output_tokens: outputTokens },
+    })
+    await writeEvent('message_stop', { type: 'message_stop' })
+    res.end()
+
+    // Capture timing snapshot before releasing the session lock
+    const endedAt = Date.now()
+    const repairedCount = repairResult.repairedCount
+
+    // Post-stream accounting runs outside the lock so the session is immediately
+    // available for the next request — all operations here are in-memory only.
+    setImmediate(() => {
+      const accountDurationMs = endedAt - accountAttemptStartedAt
+      const runtimeSummary = markAccountSuccess(account.accountId, {
+        durationMs: accountDurationMs, outputTokens, reason: stopReason,
+      })
+      session.requestCount += 1
+      session.turns += 1
+      session.updatedAt = new Date().toISOString()
+      session.lastStopReason = stopReason
+      session.lastError = null
+      bridgeSessions.set(sessionName, session)
+
+      const toolSummary = summarizeAnthropicTools(body.tools)
+      const promptText = [normalizeAnthropicSystem(body.system), JSON.stringify(openAIMessages)]
+        .filter(Boolean).join('\n')
+      recordUsage({
+        id: randomUUID(),
+        createdAt: new Date().toISOString(),
+        session: sessionName,
+        requestKind: 'anthropic',
+        stream: true,
+        model: publicModel,
+        agentId: session.agentId,
+        backendModel: runtimeConfig.backendModel,
+        promptTokens: inputTokens,
+        outputTokens,
+        totalTokens: inputTokens + outputTokens,
+        promptChars: promptText.length,
+        outputChars: textBuf.length,
+        durationMs: endedAt - requestStartedAt,
+        accountDurationMs,
+        codebuffMetadata: buildCodebuffMetadata(session),
+        stopReason,
+        toolCount: toolSummary.toolCount,
+        toolSources: toolSummary.toolSources,
+        errorSummary: repairedCount > 0
+          ? `Repaired ${repairedCount} invalid tool call(s)` : null,
+        previousAccountId: previousAccount?.accountId || activePreviousAccountId,
+        previousAccountEmail: previousAccount?.email || null,
+        accountSwitched: switched,
+        accountSelectionReason: reason,
+        accountSelectionScore: score,
+        accountSampleCount: runtimeSummary.sampleCount,
+        accountTpsSnapshot: runtimeSummary.avgTps,
+        accountAvgDurationMs: runtimeSummary.avgDurationMs,
+        ...getAccountPresentation(account),
+      })
+    })
+  })
 }
 
 async function executeAnthropicRequest({ sessionName, body, headers, url }) {
@@ -3275,18 +3573,15 @@ const server = createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/v1/messages') {
       const body = await readJsonBody(req)
       const sessionName = resolveSessionName(body, req.headers, url)
-      const anthropicMessage = await executeAnthropicRequest({
-        sessionName,
-        body,
-        headers: req.headers,
-        url,
-      })
 
       if (body.stream === true) {
-        sendAnthropicSse(res, anthropicMessage)
+        await streamAnthropicRequest(res, { sessionName, body, headers: req.headers, url })
         return
       }
 
+      const anthropicMessage = await executeAnthropicRequest({
+        sessionName, body, headers: req.headers, url,
+      })
       sendJson(res, 200, anthropicMessage)
       return
     }
@@ -3316,6 +3611,10 @@ const server = createServer(async (req, res) => {
       },
     })
   } catch (error) {
+    if (res.headersSent) {
+      try { res.end() } catch {}
+      return
+    }
     const statusCode =
       typeof error?.statusCode === 'number' ? error.statusCode : 500
 
