@@ -1,120 +1,68 @@
 # Freebuff Bridge
 
-本项目在本地暴露一个兼容 Anthropic/OpenAI 协议的桥接服务，供 Claude Code 及其他客户端使用。
+本地 Anthropic/OpenAI 兼容桥接服务，将 Claude Code 及其他客户端的请求转发至 Freebuff/Codebuff 官方后端，免费使用 AI 编程能力。
 
-同时内置一个本地浏览器控制台，访问地址 `http://127.0.0.1:8765/`，功能包括：
+## 工作原理
 
-- 查看登录状态与账号信息
-- 发起官方 Freebuff 登录流程
-- 运行时切换模型与 Agent 配置
-- 查看当前活跃的桥接会话
-- 查看每次请求的 Token 用量记录
+```
+Claude Code / 其他客户端
+        │  Anthropic 或 OpenAI 格式
+        ▼
+  Freebuff Bridge（本地 :8765）
+        │  Codebuff 官方 API
+        ▼
+  codebuff.com/api/v1/chat/completions
+```
 
-桥接服务不再通过 `tmux` 驱动 `freebuff` CLI，改为：
+- 从 `~/.config/manicode/credentials.json` 或 `CODEBUFF_API_KEY` 读取凭证
+- 为每个会话创建 Codebuff `agent-run`，维护对话上下文
+- 在 Anthropic `tool_use`/`tool_result` 与 OpenAI `tool_calls`/`tool` 之间双向翻译
+- 支持流式（SSE）与非流式响应
+- 支持原生工具、MCP 工具、插件工具
 
-- 从 `~/.config/manicode/credentials.json` 或环境变量 `CODEBUFF_API_KEY` 读取官方凭证
-- 为每个桥接会话创建官方 Codebuff `agent-runs`
-- 直接调用官方接口 `https://www.codebuff.com/api/v1/chat/completions`
-- 在 Claude/Anthropic 的 `tool_use`/`tool_result` 与 OpenAI 兼容格式 `tool_calls`/`tool` 消息之间进行双向翻译
-- 在内存中维护每个会话的 Run 元数据
+当前固定使用 **Free 模式**，可选后端模型：
 
-## 接口列表
-
-- `GET /health`
-- `GET /`
-- `GET /v1/models`
-- `POST /v1/messages`
-- `POST /v1/messages/count_tokens`
-- `POST /v1/chat/completions`
-- `GET /v1/freebuff/admin/overview`
-- `GET /v1/freebuff/config`
-- `POST /v1/freebuff/config`
-- `GET /v1/freebuff/usage`
-- `POST /v1/freebuff/usage/reset`
-- `GET /v1/freebuff/status`
-- `POST /v1/freebuff/login`
-- `GET /v1/freebuff/login/status`
-- `POST /v1/freebuff/logout`
-- `POST /v1/freebuff/reset`
+| 模型 | 提供方 |
+|------|--------|
+| `z-ai/glm-5.1` | Z.AI / Fireworks |
+| `minimax/minimax-m2.7` | MiniMax |
 
 ## 环境要求
 
 - Node.js 18+
-- 有效的 Freebuff/Codebuff 认证 Token，来源之一：
-  - 已通过官方 CLI/网页登录保存在 `~/.config/manicode/credentials.json`
-  - 或通过环境变量 `CODEBUFF_API_KEY` 提供
+- 有效的 Freebuff/Codebuff 账号凭证
 
-## 安装
+## 快速开始
 
 ```bash
 npm install
-```
-
-## 启动
-
-```bash
 npm start
 ```
 
-服务默认监听 `127.0.0.1:8765`。
-
-打开控制台：
+服务启动后监听 `http://127.0.0.1:8765`，打开浏览器访问控制台：
 
 ```bash
-open http://127.0.0.1:8765/
-```
-
-## 环境变量
-
-```bash
-PORT=8765
-HOST=127.0.0.1
-FREEBUFF_CWD=/absolute/path/to/project
-FREEBUFF_MODEL=freebuff-bridge
-FREEBUFF_AGENT_ID=base2-free
-FREEBUFF_COST_MODE=free
-FREEBUFF_BACKEND_MODEL=z-ai/glm-5.1
-FREEBUFF_SESSION_ID=default
-FREEBUFF_LOGIN_SESSION_ID=login
-FREEBUFF_RESPONSE_TIMEOUT_MS=180000
-FREEBUFF_LOGIN_BASE_URL=https://freebuff.com
-FREEBUFF_USAGE_HISTORY_LIMIT=500
-CODEBUFF_API_KEY=...
+open http://127.0.0.1:8765
 ```
 
 ## 接入 Claude Code
 
-将 Claude Code 指向本地桥接服务：
+**1. 设置环境变量**
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8765
 export ANTHROPIC_API_KEY=dummy
 ```
 
-然后指定模型 `freebuff-bridge`。
+`ANTHROPIC_API_KEY` 仅为占位，真正的鉴权走本地 Freebuff 凭证。
 
-**完整接入步骤：**
-
-1. 启动桥接服务
-
-```bash
-npm start
-```
-
-2. 配置环境变量
-
-```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8765
-export ANTHROPIC_API_KEY=dummy
-```
-
-3. 指定模型启动 Claude Code
+**2. 启动 Claude Code**
 
 ```bash
 claude --model freebuff-bridge
 ```
 
-4. 持久化配置（写入 `~/.claude/settings.json`）
+**3. 持久化配置**（写入 `~/.claude/settings.json`）
 
 ```json
 {
@@ -126,118 +74,82 @@ claude --model freebuff-bridge
 }
 ```
 
-5. 验证登录状态
+**4. 验证连接**
 
 ```bash
 curl http://127.0.0.1:8765/health
 ```
 
-返回中 `authenticated` 为 `true` 即表示桥接已就绪。
+返回 `"authenticated": true` 即接通。
 
-## 登录
+## 首次登录
 
-如果本地尚无已保存的凭证，发起官方登录流程：
+如果本地没有已保存的凭证，通过以下方式发起登录：
 
 ```bash
-curl http://127.0.0.1:8765/v1/freebuff/login \
+curl -X POST http://127.0.0.1:8765/v1/freebuff/login \
   -H 'Content-Type: application/json' \
-  -d '{ "reset": true }'
+  -d '{"reset": true}'
 ```
 
-返回 `loginUrl`，在浏览器中打开并完成登录，然后轮询状态：
+返回 `loginUrl`，在浏览器中打开并完成官方登录，然后查询状态：
 
 ```bash
 curl "http://127.0.0.1:8765/v1/freebuff/login/status?session=login"
 ```
 
-登录成功后，凭证会自动保存至 `~/.config/manicode/credentials.json`。
+登录成功后凭证自动保存至 `~/.config/manicode/credentials.json`。
 
-也可以直接通过控制台页面完成上述操作。
+也可以直接在控制台页面点击"开始登录"完成上述流程。
 
 ## 控制台
 
-控制台挂载在 `/`，用于本地管理，包含：
+访问 `http://127.0.0.1:8765`，提供：
 
-- 账号状态与邮箱信息
-- 登录按钮（生成官方 Freebuff 登录链接）
-- 登出按钮（清除本地凭证）
-- Claude Code 接入教程
-- Claude Code 协议兼容状态
+- 账号状态与登录/登出操作
 - 运行时配置（模型别名、Agent ID、后端模型）
-- 用量汇总卡片与逐请求 Token 历史
-- 活跃会话列表及重置按钮
+- 活跃会话列表与重置
+- Token 用量统计（按请求明细）
+- Claude Code 工具协议兼容状态
 
-当前支持的 Free 模式后端模型：
+## 环境变量
 
-- `z-ai/glm-5.1`
-- `minimax/minimax-m2.7`
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `PORT` | `8765` | 监听端口 |
+| `HOST` | `127.0.0.1` | 监听地址 |
+| `CODEBUFF_API_KEY` | — | 直接提供 API Token |
+| `FREEBUFF_MODEL` | `freebuff-bridge` | Claude 侧模型别名 |
+| `FREEBUFF_AGENT_ID` | `base2-free` | Codebuff Agent ID |
+| `FREEBUFF_BACKEND_MODEL` | `z-ai/glm-5.1` | 后端实际模型 |
+| `FREEBUFF_RESPONSE_TIMEOUT_MS` | `180000` | 请求超时（毫秒） |
+| `FREEBUFF_USAGE_HISTORY_LIMIT` | `500` | 内存中保留的用量条数 |
+| `FREEBUFF_LOGIN_BASE_URL` | `https://freebuff.com` | 登录基础 URL |
+| `FREEBUFF_API_BASE_URL` | `https://www.codebuff.com` | API 基础 URL |
 
-## 会话状态
+## 接口列表
 
-查看桥接认证状态与各会话详情：
-
-```bash
-curl http://127.0.0.1:8765/v1/freebuff/status
-```
-
-关键响应字段：
-
-- `authenticated`：当前是否持有有效凭证
-- `exists`：该会话是否已在内存中创建
-- `hasRunState`：该会话是否已有 Codebuff `RunState`
-- `turns`：该会话已完成的对话轮次
-- `codebuffMetadata`：该会话的模拟元数据（`client_id`、`run_id`、`cost_mode`、`n`）
-- `usageSummary`：聚合 Token/请求计数
-- `compatibility`：原生工具 / MCP / 插件工具兼容状态
-
-## 请求示例
-
-**Anthropic 格式：**
-
-```bash
-curl http://127.0.0.1:8765/v1/messages \
-  -H 'Content-Type: application/json' \
-  -H 'x-freebuff-session: demo' \
-  -H 'anthropic-version: 2023-06-01' \
-  -d '{
-    "model": "freebuff-bridge",
-    "max_tokens": 256,
-    "system": "Keep replies concise.",
-    "messages": [
-      { "role": "user", "content": "Reply with exactly OK." }
-    ]
-  }'
-```
-
-**OpenAI 兼容格式：**
-
-```bash
-curl http://127.0.0.1:8765/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -H 'x-freebuff-session: demo' \
-  -d '{
-    "model": "freebuff-bridge",
-    "messages": [
-      { "role": "system", "content": "Keep replies concise." },
-      { "role": "user", "content": "Reply with exactly OK." }
-    ]
-  }'
-```
-
-## 重置会话
-
-```bash
-curl http://127.0.0.1:8765/v1/freebuff/reset \
-  -H 'Content-Type: application/json' \
-  -d '{ "session": "demo" }'
-```
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/health` | 健康检查与认证状态 |
+| GET | `/` | 控制台页面 |
+| GET | `/v1/models` | 模型列表 |
+| POST | `/v1/messages` | Anthropic Messages 接口 |
+| POST | `/v1/messages/count_tokens` | Token 数估算 |
+| POST | `/v1/chat/completions` | OpenAI Chat Completions 接口 |
+| GET | `/v1/freebuff/status` | 会话与认证详情 |
+| GET | `/v1/freebuff/config` | 当前运行时配置 |
+| POST | `/v1/freebuff/config` | 更新运行时配置 |
+| GET | `/v1/freebuff/usage` | Token 用量记录 |
+| POST | `/v1/freebuff/usage/reset` | 清空用量记录 |
+| POST | `/v1/freebuff/login` | 发起登录流程 |
+| GET | `/v1/freebuff/login/status` | 查询登录状态 |
+| POST | `/v1/freebuff/logout` | 登出（清除本地凭证） |
+| POST | `/v1/freebuff/reset` | 重置指定桥接会话 |
+| GET | `/v1/freebuff/admin/overview` | 全局概览 |
 
 ## 注意事项
 
-- 同一桥接会话的请求会串行处理。
-- 对话状态保存在桥接管理的 `run_id + transcript` 元数据中，与终端会话无关。
-- Anthropic 流式响应由翻译后的 Codebuff/OpenAI 响应驱动。
-- 桥接内部模拟 `codebuff_metadata`，Claude Code 无需主动传递。
-- 运行时修改配置会清除内存中的桥接会话，避免新模型/Agent 与旧 `RunState` 混用。
+- 同一会话的请求串行处理，不会并发竞争。
+- 修改运行时配置会清除所有内存中的会话，避免新旧 RunState 混用。
 - 用量记录仅保存在内存中，重启后清空。
-- `costMode` 固定为 `free`，不提供其他模式切换。
