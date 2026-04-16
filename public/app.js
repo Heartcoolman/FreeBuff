@@ -3,26 +3,30 @@ const state = {
   loginSession: null,
 }
 
-const fallbackBackendModels = [
-  {
-    value: 'z-ai/glm-5.1',
-    label: 'GLM 5.1',
-    provider: 'Z.AI / Fireworks',
-  },
-  {
-    value: 'minimax/minimax-m2.7',
-    label: 'MiniMax M2.7',
-    provider: 'MiniMax',
-  },
-]
+const fallbackBackendModels = {
+  free: [
+    { value: 'z-ai/glm-5.1', label: 'GLM 5.1', provider: 'Z.AI / Fireworks' },
+    { value: 'minimax/minimax-m2.7', label: 'MiniMax M2.7', provider: 'MiniMax' },
+  ],
+}
+
+function populateModelDropdown(models, selectedValue) {
+  const opts = [...models]
+  if (selectedValue && !opts.some((m) => m.value === selectedValue)) {
+    opts.unshift({ value: selectedValue, label: selectedValue, provider: '当前值' })
+  }
+  els.configBackendModel.innerHTML = opts
+    .map((m) => `<option value="${m.value}">${m.label} (${m.provider})</option>`)
+    .join('')
+  els.configBackendModel.value = selectedValue || ''
+}
 
 const els = {
   authPill: document.querySelector('#auth-pill'),
-  authEmail: document.querySelector('#auth-email'),
-  authSource: document.querySelector('#auth-source'),
-  authMeta: document.querySelector('#auth-meta'),
+  authSummary: document.querySelector('#auth-summary'),
   loginActions: document.querySelector('#login-actions'),
   loginUrlBox: document.querySelector('#login-url-box'),
+  accountsList: document.querySelector('#accounts-list'),
   summaryCards: document.querySelector('#summary-cards'),
   compatibilityCard: document.querySelector('#compatibility-card'),
   sessionsList: document.querySelector('#sessions-list'),
@@ -131,26 +135,55 @@ function formatDate(value) {
   return date.toLocaleString()
 }
 
+function formatAccountName(account) {
+  if (!account) {
+    return '-'
+  }
+
+  if (account.email) {
+    return account.email
+  }
+
+  if (account.source === 'environment') {
+    return '环境变量账号'
+  }
+
+  return account.accountId || '-'
+}
+
+function accountStatusPill(label, tone = 'neutral') {
+  return `<span class="account-status account-status-${tone}">${label}</span>`
+}
+
 function renderAccount(overview) {
   const auth = overview.auth
-  els.authPill.textContent = auth.authenticated ? '已登录' : '未登录'
+  const accounts = Array.isArray(overview.accounts) ? overview.accounts : []
+  els.authPill.textContent = auth.authenticated
+    ? `${auth.availableAccounts || 0} 个可用账号`
+    : '未登录'
   els.authPill.classList.toggle('pill-ok', !!auth.authenticated)
   els.authPill.classList.toggle('pill-err', !auth.authenticated)
+  els.authSummary.innerHTML = `
+    <div class="summary-strip">
+      <div class="stat-chip"><span>可用账号</span><strong>${auth.availableAccounts || 0}</strong></div>
+      <div class="stat-chip"><span>总账号数</span><strong>${auth.totalAccounts || 0}</strong></div>
+      <div class="stat-chip"><span>环境账号</span><strong>${auth.environmentAccountPresent ? '有' : '无'}</strong></div>
+    </div>`
 
   const s = state.loginSession
   const loginUrl = s?.loginUrl
 
-  if (auth.authenticated) {
-    els.authEmail.textContent = auth.email || '-'
-    els.authSource.textContent = auth.source || '-'
-    els.authMeta.style.display = ''
-    els.loginUrlBox.innerHTML = ''
+  if (s?.authenticated) {
+    els.loginUrlBox.innerHTML = `
+      <div class="callout">
+        <p class="callout-title">账号已加入池</p>
+        <p class="muted" style="margin: 4px 0 0;">${s.email || s.accountId || '新账号'} 已保存到本地，可参与新会话轮训。</p>
+      </div>`
     els.loginActions.innerHTML = `
       <div class="button-row">
-        <button class="button button-danger" data-action="logout">清除本地登录</button>
+        <button class="button button-primary" data-action="start-login">新增登录账号</button>
       </div>`
   } else if (loginUrl && s?.expired) {
-    els.authMeta.style.display = 'none'
     els.loginUrlBox.innerHTML = `
       <div class="callout callout-err">
         <p class="callout-title">登录链接已过期</p>
@@ -162,7 +195,6 @@ function renderAccount(overview) {
       </div>`
   } else if (loginUrl) {
     const polling = !!autoPoll.timerId
-    els.authMeta.style.display = 'none'
     els.loginUrlBox.innerHTML = `
       <div class="callout">
         <p class="callout-title">登录链接${polling ? '<span class="poll-dot"></span>' : ''}</p>
@@ -181,49 +213,83 @@ function renderAccount(overview) {
         <button class="button button-ghost" data-action="start-login">重新生成</button>
       </div>`
   } else {
-    els.authMeta.style.display = 'none'
     els.loginUrlBox.innerHTML = `
       <div class="callout">
-        <p class="muted" style="margin: 0;">点击开始登录后会生成官方 Freebuff 登录地址。</p>
+        <p class="muted" style="margin: 0;">点击新增登录账号后会生成官方 Freebuff 登录地址，可连续加入多个账号。</p>
       </div>`
     els.loginActions.innerHTML = `
       <div class="button-row">
-        <button class="button button-primary" data-action="start-login">开始登录</button>
+        <button class="button button-primary" data-action="start-login">新增登录账号</button>
       </div>`
   }
+
+  els.accountsList.innerHTML = ''
+  if (accounts.length === 0) {
+    els.accountsList.innerHTML = '<div class="empty">当前还没有可用账号。</div>'
+    return
+  }
+
+  els.accountsList.innerHTML = `
+    <div class="account-pool-head">
+      <div>
+        <p class="label">账号池</p>
+        <p class="muted" style="margin: 0;">新会话按轮训挑选账号；这里只保留紧凑列表，不再展开大卡片。</p>
+      </div>
+    </div>
+    <div class="table-wrap account-table-wrap">
+      <table class="account-table">
+        <thead>
+          <tr>
+            <th>账号</th>
+            <th>来源</th>
+            <th>轮训</th>
+            <th>绑定</th>
+            <th>更新时间</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${accounts
+            .map(
+              (account) => `
+                <tr>
+                  <td>
+                    <div class="account-cell-main">${formatAccountName(account)}</div>
+                    <div class="account-subline">${account.accountId}</div>
+                  </td>
+                  <td>${account.source || '-'}</td>
+                  <td>${account.inPool ? accountStatusPill('参与中', 'ok') : accountStatusPill('已停用', 'warn')}</td>
+                  <td>${account.boundSessionCount || 0}</td>
+                  <td>${formatDate(account.updatedAt)}</td>
+                  <td class="account-action-cell">
+                    ${
+                      account.readOnly
+                        ? '<span class="pill pill-soft">只读</span>'
+                        : `<button class="button button-danger button-sm" data-action="logout-account" data-account-id="${account.accountId}">登出</button>`
+                    }
+                  </td>
+                </tr>`,
+            )
+            .join('')}
+        </tbody>
+      </table>
+    </div>`
 }
 
 function renderConfig(overview) {
   const config = overview.config
   els.configModelAlias.value = config.modelAlias || ''
   els.configAgentId.value = config.agentId || ''
+  const mode = config.costMode || 'free'
   const availableModels = Array.isArray(config.availableBackendModels)
     ? config.availableBackendModels
-    : fallbackBackendModels
+    : (fallbackBackendModels[mode] ?? fallbackBackendModels.free)
 
   const selectedBackendModel =
-    config.backendModel ||
-    availableModels[0]?.value ||
-    fallbackBackendModels[0].value
+    config.backendModel || availableModels[0]?.value || ''
 
-  const modelOptions = [...availableModels]
-  if (!modelOptions.some((model) => model.value === selectedBackendModel)) {
-    modelOptions.unshift({
-      value: selectedBackendModel,
-      label: selectedBackendModel,
-      provider: '当前值',
-    })
-  }
-
-  els.configBackendModel.innerHTML = modelOptions
-    .map(
-      (model) =>
-        `<option value="${model.value}">${model.label} (${model.provider})</option>`,
-    )
-    .join('')
-  els.configBackendModel.value = selectedBackendModel
-  els.configCostMode.innerHTML = '<option value="free">free</option>'
-  els.configCostMode.value = 'free'
+  populateModelDropdown(availableModels, selectedBackendModel)
+  els.configCostMode.value = mode
 
   const modelAlias = config.modelAlias || 'freebuff-bridge'
   els.tutorialModelAlias.textContent = modelAlias
@@ -311,7 +377,8 @@ function renderSessions(overview) {
       <div><dt>轮次</dt><dd>${session.turns}</dd></div>
       <div><dt>请求数</dt><dd>${session.usage.requests}</dd></div>
       <div><dt>总 Tokens</dt><dd>${session.usage.totalTokens}</dd></div>
-      <div><dt>计费模式</dt><dd>free</dd></div>
+      <div><dt>绑定账号</dt><dd>${session.accountEmail || session.accountId || '-'}</dd></div>
+      <div><dt>计费模式</dt><dd>${session.costMode || 'free'}</dd></div>
       </div>
       <div class="muted">client_id: ${session.codebuffMetadata?.client_id || '-'}</div>
       <div class="muted">run_id: ${session.codebuffMetadata?.run_id || '-'}</div>
@@ -324,7 +391,7 @@ function renderUsageRecords(records) {
   els.usageTable.innerHTML = ''
 
   if (records.length === 0) {
-    els.usageTable.innerHTML = '<tr><td colspan="11" class="empty">当前还没有使用记录。</td></tr>'
+    els.usageTable.innerHTML = '<tr><td colspan="12" class="empty">当前还没有使用记录。</td></tr>'
     return
   }
 
@@ -332,6 +399,7 @@ function renderUsageRecords(records) {
     const row = document.createElement('tr')
     row.innerHTML = `
       <td>${formatDate(record.createdAt)}</td>
+      <td>${record.accountEmail || record.accountId || '-'}</td>
       <td>${record.session}</td>
       <td>${record.requestKind}${record.stream ? ' · 流式' : ''}</td>
       <td>${record.model}</td>
@@ -407,6 +475,17 @@ els.autoRefreshSelect.addEventListener('change', () => {
   showToast(seconds > 0 ? `已开启自动刷新（${seconds}s）` : '已关闭自动刷新')
 })
 
+els.configCostMode.addEventListener('change', async () => {
+  const mode = els.configCostMode.value
+  try {
+    const res = await request(`/v1/freebuff/models?costMode=${mode}`)
+    const models = res.models ?? []
+    populateModelDropdown(models, models[0]?.value ?? '')
+  } catch (_) {
+    populateModelDropdown(fallbackBackendModels[mode] ?? fallbackBackendModels.free, '')
+  }
+})
+
 document.addEventListener('click', async (event) => {
   const btn = event.target.closest('[data-action]')
   if (!btn) return
@@ -422,7 +501,17 @@ document.addEventListener('click', async (event) => {
           body: JSON.stringify({ reset: true }),
         })
         stopAutoPoll()
-        renderAccount(state.overview || { auth: { authenticated: false } })
+        renderAccount(
+          state.overview || {
+            auth: {
+              authenticated: false,
+              availableAccounts: 0,
+              totalAccounts: 0,
+              environmentAccountPresent: false,
+            },
+            accounts: [],
+          },
+        )
         startAutoPoll()
       })
       showToast('登录链接已生成')
@@ -443,18 +532,23 @@ document.addEventListener('click', async (event) => {
     } catch (e) {
       showToast(e.message, true)
     }
-  } else if (action === 'logout') {
+  } else if (action === 'logout-account') {
     try {
       await withLoading(btn, async () => {
         await request('/v1/freebuff/logout', {
           method: 'POST',
-          body: JSON.stringify({}),
+          body: JSON.stringify({
+            accountId: btn.dataset.accountId,
+          }),
         })
-        state.loginSession = null
+        if (state.loginSession?.accountId === btn.dataset.accountId) {
+          state.loginSession = null
+        }
         stopAutoPoll()
+        await refreshLoginStatus()
         await refreshOverview()
       })
-      showToast('本地登录已清除')
+      showToast('账号已登出')
     } catch (e) {
       showToast(e.message, true)
     }

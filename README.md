@@ -82,9 +82,9 @@ curl http://127.0.0.1:8765/health
 
 返回 `"authenticated": true` 即接通。
 
-## 首次登录
+## 首次登录 / 新增账号
 
-如果本地没有已保存的凭证，通过以下方式发起登录：
+如果本地没有已保存的凭证，或需要继续加入新的账号，通过以下方式发起登录：
 
 ```bash
 curl -X POST http://127.0.0.1:8765/v1/freebuff/login \
@@ -98,17 +98,24 @@ curl -X POST http://127.0.0.1:8765/v1/freebuff/login \
 curl "http://127.0.0.1:8765/v1/freebuff/login/status?session=login"
 ```
 
-登录成功后凭证自动保存至 `~/.config/manicode/credentials.json`。
+登录成功后，新账号会自动加入本地账号池并保存至 `~/.config/manicode/credentials.json`。
 
-也可以直接在控制台页面点击"开始登录"完成上述流程。
+也可以直接在控制台页面点击“新增登录账号”完成上述流程。
+
+## 多账号轮训
+
+- 可以同时保存多个 Freebuff 账号。
+- 新桥接会话创建时，会从全部可用账号中按轮训顺序选择一个账号。
+- 同一个桥接会话在首次命中账号后会固定绑定该账号，直到会话重置、账号被移除，或该账号认证失效后重绑。
+- `~/.config/manicode/credentials.json` 的旧单账号 `default` 格式会自动兼容读取。
 
 ## 控制台
 
 访问 `http://127.0.0.1:8765`，提供：
 
-- 账号状态与登录/登出操作
+- 账号池状态、逐账号登录/登出操作
 - 运行时配置（模型别名、Agent ID、后端模型）
-- 活跃会话列表与重置
+- 活跃会话列表、会话绑定账号与重置
 - Token 用量统计（按请求明细）
 - Claude Code 工具协议兼容状态
 
@@ -144,12 +151,14 @@ curl "http://127.0.0.1:8765/v1/freebuff/login/status?session=login"
 | POST | `/v1/freebuff/usage/reset` | 清空用量记录 |
 | POST | `/v1/freebuff/login` | 发起登录流程 |
 | GET | `/v1/freebuff/login/status` | 查询登录状态 |
-| POST | `/v1/freebuff/logout` | 登出（清除本地凭证） |
+| POST | `/v1/freebuff/logout` | 登出指定账号（请求体传 `accountId`） |
+| POST | `/v1/freebuff/logout/all` | 清空全部本地账号 |
 | POST | `/v1/freebuff/reset` | 重置指定桥接会话 |
 | GET | `/v1/freebuff/admin/overview` | 全局概览 |
 
 ## 注意事项
 
 - 同一会话的请求串行处理，不会并发竞争。
+- 会话绑定账号后默认固定，不会在每次请求之间来回切账号。
 - 修改运行时配置会清除所有内存中的会话，避免新旧 RunState 混用。
 - 用量记录仅保存在内存中，重启后清空。

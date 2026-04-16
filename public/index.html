@@ -37,22 +37,14 @@
           <div class="panel-head">
             <div>
               <p class="label">账号</p>
-              <h2>登录与凭据</h2>
+              <h2>账号池与登录</h2>
             </div>
             <span id="auth-pill" class="pill">检查中</span>
           </div>
-          <dl class="meta-list" id="auth-meta">
-            <div>
-              <dt>邮箱</dt>
-              <dd id="auth-email">-</dd>
-            </div>
-            <div>
-              <dt>来源</dt>
-              <dd id="auth-source">-</dd>
-            </div>
-          </dl>
+          <div id="auth-summary" class="stack compact"></div>
           <div id="login-actions"></div>
           <div id="login-url-box" style="margin-top: 14px;"></div>
+          <div id="accounts-list" class="stack compact" style="margin-top: 14px;"></div>
         </article>
 
         <article class="panel">
@@ -78,10 +70,13 @@
             </label>
             <label class="field">
               <span>计费模式</span>
-              <select id="config-cost-mode" name="costMode" disabled>
+              <select id="config-cost-mode" name="costMode">
                 <option value="free">free</option>
+                <option value="normal">normal</option>
+                <option value="max">max</option>
+                <option value="ask">ask</option>
+                <option value="plan">plan</option>
               </select>
-              <p class="muted" style="margin: 4px 0 0;">当前桥仅保留 Free 模式。</p>
             </label>
             <div class="button-row">
               <button type="submit" class="button button-primary">保存运行配置</button>
@@ -131,6 +126,7 @@
               <thead>
                 <tr>
                   <th>时间</th>
+                  <th>账号</th>
                   <th>会话</th>
                   <th>类型</th>
                   <th>模型</th>
@@ -187,7 +183,7 @@ export ANTHROPIC_API_KEY=dummy</code></pre>
 
             <div class="callout">
               <p class="callout-title">5. 第一次使用前先确认登录</p>
-              <p class="muted">如果上面的账号区域显示未登录，先点"开始登录"，浏览器完成 Freebuff 官方登录后，再点"检查登录状态"。</p>
+              <p class="muted">如果上面的账号区域还没有可用账号，先点"新增登录账号"，浏览器完成 Freebuff 官方登录后，再点"检查登录状态"。</p>
             </div>
 
             <div class="callout">

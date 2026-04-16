@@ -1,5 +1,5 @@
 import { createServer } from 'node:http'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -30,23 +30,51 @@ const runtimeConfig = {
   backendModel: process.env.FREEBUFF_BACKEND_MODEL || 'z-ai/glm-5.1',
 }
 
-const FREE_ALLOWED_BACKEND_MODELS = [
-  {
-    value: 'z-ai/glm-5.1',
-    label: 'GLM 5.1',
-    provider: 'Z.AI / Fireworks',
-  },
-  {
-    value: 'minimax/minimax-m2.7',
-    label: 'MiniMax M2.7',
-    provider: 'MiniMax',
-  },
+const FREE_BACKEND_MODELS = [
+  { value: 'z-ai/glm-5.1', label: 'GLM 5.1', provider: 'Z.AI / Fireworks' },
+  { value: 'minimax/minimax-m2.7', label: 'MiniMax M2.7', provider: 'MiniMax' },
 ]
+
+const VALID_COST_MODES = new Set(['free', 'normal', 'max', 'ask', 'plan'])
+
+const DEFAULT_AGENT_IDS = {
+  free: 'base2-free',
+  normal: 'base2',
+  max: 'base2-max',
+  ask: 'ask',
+  plan: 'base2-plan',
+}
+
+let openRouterModelsCache = null
+let openRouterModelsCachedAt = 0
+const OPENROUTER_MODELS_TTL = 60 * 60 * 1000
+
+async function getOpenRouterModels() {
+  const now = Date.now()
+  if (openRouterModelsCache && now - openRouterModelsCachedAt < OPENROUTER_MODELS_TTL) {
+    return openRouterModelsCache
+  }
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/models')
+    if (!res.ok) return openRouterModelsCache ?? []
+    const json = await res.json()
+    openRouterModelsCache = (json.data || []).map((m) => ({
+      value: m.id,
+      label: m.name || m.id,
+      provider: m.id.split('/')[0] || '',
+    }))
+    openRouterModelsCachedAt = now
+    return openRouterModelsCache
+  } catch {
+    return openRouterModelsCache ?? []
+  }
+}
 
 const sessionLocks = new Map()
 const bridgeSessions = new Map()
 const loginSessions = new Map()
 const usageRecords = []
+let accountRotationCursor = 0
 
 process.on('uncaughtException', (error) => {
   console.error('[freebuff-bridge] uncaughtException', error)
@@ -156,86 +184,364 @@ function writeCredentialsFile(data) {
   fs.writeFileSync(credentialsPath, JSON.stringify(data, null, 2))
 }
 
-function clearUserCredentials() {
+function stableAccountId(...parts) {
+  const seed = firstNonEmpty(...parts, randomUUID())
+  return `acct-${createHash('sha1').update(seed).digest('hex').slice(0, 12)}`
+}
+
+function normalizeStoredAccount(record) {
+  if (!record || typeof record !== 'object') {
+    return null
+  }
+
+  const authToken =
+    typeof record.authToken === 'string' ? record.authToken.trim() : ''
+  if (!authToken) {
+    return null
+  }
+
+  const email =
+    typeof record.email === 'string' && record.email.trim()
+      ? record.email.trim()
+      : null
+  const externalId = firstNonEmpty(record.userId, record.id, email, authToken)
+  const createdAt =
+    typeof record.createdAt === 'string' && record.createdAt
+      ? record.createdAt
+      : new Date().toISOString()
+  const updatedAt =
+    typeof record.updatedAt === 'string' && record.updatedAt
+      ? record.updatedAt
+      : createdAt
+
+  return {
+    ...record,
+    accountId:
+      typeof record.accountId === 'string' && record.accountId.trim()
+        ? record.accountId.trim()
+        : stableAccountId(externalId),
+    authToken,
+    email,
+    source: 'credentials',
+    authenticated: true,
+    createdAt,
+    updatedAt,
+  }
+}
+
+function serializeStoredAccount(account) {
+  const next = { ...account }
+  delete next.authenticated
+  delete next.readOnly
+  next.source = 'credentials'
+  return next
+}
+
+function readStoredAccountsState() {
+  const raw = readCredentialsFile()
+  const candidates = []
+
+  if (Array.isArray(raw.accounts)) {
+    candidates.push(...raw.accounts)
+  }
+
+  if (raw.default && typeof raw.default === 'object') {
+    candidates.push(raw.default)
+  }
+
+  const seen = new Set()
+  const accounts = []
+  for (const candidate of candidates) {
+    const normalized = normalizeStoredAccount(candidate)
+    if (!normalized || seen.has(normalized.accountId)) {
+      continue
+    }
+    seen.add(normalized.accountId)
+    accounts.push(normalized)
+  }
+
+  return {
+    raw,
+    accounts,
+  }
+}
+
+function writeStoredAccounts(accounts) {
   const credentialsPath = getCredentialsPath()
-  if (!fs.existsSync(credentialsPath)) {
-    return
-  }
-
-  const current = readCredentialsFile()
-  const { default: _removed, ...rest } = current
-  if (Object.keys(rest).length === 0) {
-    fs.unlinkSync(credentialsPath)
-    return
-  }
-
-  writeCredentialsFile(rest)
-}
-
-function getStoredCredentials() {
-  const data = readCredentialsFile()
-  const user = data.default
-  if (!user || typeof user !== 'object') {
-    return null
-  }
-  if (typeof user.authToken !== 'string' || !user.authToken) {
-    return null
-  }
-
-  return user
-}
-
-function saveUserCredentials(user) {
-  const current = readCredentialsFile()
-  writeCredentialsFile({
+  const current = readStoredAccountsState().raw
+  const nextAccounts = accounts.map((account) => serializeStoredAccount(account))
+  const next = {
     ...current,
-    default: user,
-  })
+    accounts: nextAccounts,
+  }
+
+  if (nextAccounts[0]) {
+    next.default = nextAccounts[0]
+  } else {
+    delete next.default
+    delete next.accounts
+  }
+
+  if (Object.keys(next).length === 0) {
+    if (fs.existsSync(credentialsPath)) {
+      fs.unlinkSync(credentialsPath)
+    }
+    return
+  }
+
+  writeCredentialsFile(next)
 }
 
-function resolveAuthState() {
+function getStoredAccounts() {
+  return readStoredAccountsState().accounts
+}
+
+function buildEnvironmentAccount() {
   const envToken = firstNonEmpty(
     process.env.CODEBUFF_API_KEY,
     process.env.FREEBUFF_AUTH_TOKEN,
   )
-
-  if (envToken) {
-    return {
-      authenticated: true,
-      token: envToken,
-      source: 'environment',
-      user: null,
-      email: null,
-    }
-  }
-
-  const stored = getStoredCredentials()
-  if (stored) {
-    return {
-      authenticated: true,
-      token: stored.authToken,
-      source: 'credentials',
-      user: stored,
-      email: typeof stored.email === 'string' ? stored.email : null,
-    }
+  if (!envToken) {
+    return null
   }
 
   return {
-    authenticated: false,
-    token: null,
-    source: null,
-    user: null,
+    accountId: 'env-default',
+    authToken: envToken,
     email: null,
+    source: 'environment',
+    authenticated: true,
+    readOnly: true,
+    createdAt: null,
+    updatedAt: null,
   }
 }
 
-function getRuntimeConfig() {
+function listAuthAccounts() {
+  const accounts = []
+  const envAccount = buildEnvironmentAccount()
+  if (envAccount) {
+    accounts.push(envAccount)
+  }
+
+  accounts.push(
+    ...getStoredAccounts().map((account) => ({
+      ...account,
+      readOnly: false,
+    })),
+  )
+
+  return accounts
+}
+
+function getAccountById(accountId) {
+  if (!accountId) {
+    return null
+  }
+
+  return listAuthAccounts().find((account) => account.accountId === accountId) || null
+}
+
+function listAvailableAccounts(excludedAccountIds = []) {
+  const excluded = new Set(excludedAccountIds.filter(Boolean))
+  return listAuthAccounts().filter(
+    (account) =>
+      account.authenticated &&
+      typeof account.authToken === 'string' &&
+      account.authToken &&
+      !excluded.has(account.accountId),
+  )
+}
+
+function selectNextAccount(excludedAccountIds = []) {
+  const accounts = listAvailableAccounts(excludedAccountIds)
+  if (accounts.length === 0) {
+    return null
+  }
+
+  const index = accountRotationCursor % accounts.length
+  accountRotationCursor = (accountRotationCursor + 1) % accounts.length
+  return accounts[index]
+}
+
+function summarizeAuthPool(accounts = listAuthAccounts()) {
+  const availableAccounts = accounts.filter(
+    (account) => account.authenticated && account.authToken,
+  )
+  const primary =
+    availableAccounts.length === 1
+      ? availableAccounts[0]
+      : null
+
+  return {
+    authenticated: availableAccounts.length > 0,
+    source: primary ? primary.source : availableAccounts.length > 1 ? 'pool' : null,
+    email: primary ? primary.email : null,
+    totalAccounts: accounts.length,
+    availableAccounts: availableAccounts.length,
+    environmentAccountPresent: accounts.some(
+      (account) => account.source === 'environment',
+    ),
+  }
+}
+
+function upsertStoredAccount(user, loginSession = null) {
+  const { accounts } = readStoredAccountsState()
+  const existing = accounts.find(
+    (account) =>
+      (firstNonEmpty(account.id) &&
+        firstNonEmpty(user?.id) &&
+        firstNonEmpty(account.id) === firstNonEmpty(user?.id)) ||
+      (account.email && user?.email && account.email === user.email),
+  )
+
+  const nextAccount = normalizeStoredAccount({
+    ...(existing || {}),
+    ...(user || {}),
+    accountId: existing?.accountId || stableAccountId(user?.id, user?.email),
+    fingerprintId:
+      loginSession?.fingerprintId ||
+      firstNonEmpty(user?.fingerprintId, existing?.fingerprintId) ||
+      null,
+    fingerprintHash:
+      loginSession?.fingerprintHash ||
+      firstNonEmpty(user?.fingerprintHash, existing?.fingerprintHash) ||
+      null,
+    createdAt: existing?.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  })
+
+  if (!nextAccount) {
+    throw new Error('Failed to normalize account credentials.')
+  }
+
+  const remaining = accounts.filter(
+    (account) => account.accountId !== nextAccount.accountId,
+  )
+  writeStoredAccounts([nextAccount, ...remaining])
+  return nextAccount
+}
+
+function removeStoredAccount(accountId) {
+  const { accounts } = readStoredAccountsState()
+  const nextAccounts = accounts.filter((account) => account.accountId !== accountId)
+  const removed = nextAccounts.length !== accounts.length
+  if (removed) {
+    writeStoredAccounts(nextAccounts)
+  }
+  return removed
+}
+
+function resolveAuthState() {
+  return summarizeAuthPool()
+}
+
+async function getRuntimeConfig() {
+  const mode = runtimeConfig.costMode
+  const availableBackendModels =
+    mode === 'free' ? FREE_BACKEND_MODELS : await getOpenRouterModels()
   return {
     modelAlias: runtimeConfig.modelAlias,
     agentId: runtimeConfig.agentId,
-    costMode: 'free',
+    costMode: mode,
     backendModel: runtimeConfig.backendModel,
-    availableBackendModels: FREE_ALLOWED_BACKEND_MODELS,
+    availableBackendModels,
+  }
+}
+
+function getSessionBoundAccount(session) {
+  return session?.accountId ? getAccountById(session.accountId) : null
+}
+
+function getAccountPresentation(account) {
+  if (!account) {
+    return {
+      accountId: null,
+      accountEmail: null,
+      accountSource: null,
+    }
+  }
+
+  return {
+    accountId: account.accountId,
+    accountEmail: account.email,
+    accountSource: account.source,
+  }
+}
+
+function resetSessionRunState(session, reason = null) {
+  if (!session) {
+    return
+  }
+
+  session.runId = null
+  session.updatedAt = new Date().toISOString()
+  session.lastError = reason
+}
+
+function bindSessionToAccount(session, account, reason = null) {
+  if (!session || !account) {
+    return null
+  }
+
+  if (session.accountId !== account.accountId) {
+    resetSessionRunState(session, reason)
+    session.accountId = account.accountId
+  }
+
+  session.updatedAt = new Date().toISOString()
+  bridgeSessions.set(session.session, session)
+  return account
+}
+
+function ensureSessionAccount(session, excludedAccountIds = []) {
+  const current = getSessionBoundAccount(session)
+  if (current && !excludedAccountIds.includes(current.accountId)) {
+    return current
+  }
+
+  const nextAccount = selectNextAccount(
+    [session?.accountId, ...excludedAccountIds].filter(Boolean),
+  )
+  if (!nextAccount) {
+    return null
+  }
+
+  return bindSessionToAccount(session, nextAccount, 'Account binding refreshed.')
+}
+
+async function releaseSessionsForAccount(accountId, status = 'cancelled') {
+  const sessions = Array.from(bridgeSessions.values()).filter(
+    (session) => session.accountId === accountId,
+  )
+
+  await Promise.allSettled(
+    sessions.map(async (session) => {
+      const account = getSessionBoundAccount(session)
+      await finishSessionRun(account?.authToken, session, status)
+      bridgeSessions.delete(session.session)
+    }),
+  )
+}
+
+function clearLoginSessionsForAccount(accountId) {
+  for (const [sessionName, session] of loginSessions.entries()) {
+    if (session?.accountId === accountId) {
+      loginSessions.delete(sessionName)
+    }
+  }
+}
+
+function buildAuthPresentation(sessionName = null) {
+  const auth = resolveAuthState()
+  const session = sessionName ? bridgeSessions.get(sessionName) : null
+  const boundAccount = getSessionBoundAccount(session)
+
+  return {
+    ...auth,
+    authSource: boundAccount?.source || auth.source,
+    email: boundAccount?.email || auth.email,
+    boundAccountId: boundAccount?.accountId || null,
   }
 }
 
@@ -267,41 +573,51 @@ async function finishSessionRun(authToken, session, status = 'cancelled') {
   }
 }
 
-async function finishAllSessions(authToken, status = 'cancelled') {
+async function finishAllSessions(status = 'cancelled') {
   const sessions = Array.from(bridgeSessions.values())
   await Promise.allSettled(
-    sessions.map((session) => finishSessionRun(authToken, session, status)),
+    sessions.map((session) => {
+      const account = getSessionBoundAccount(session)
+      return finishSessionRun(account?.authToken, session, status)
+    }),
   )
 }
 
 async function applyRuntimeConfig(updates = {}) {
-  const previous = getRuntimeConfig()
+  const previous = await getRuntimeConfig()
 
   if (typeof updates.modelAlias === 'string' && updates.modelAlias.trim()) {
     runtimeConfig.modelAlias = updates.modelAlias.trim()
   }
 
-  if (typeof updates.agentId === 'string' && updates.agentId.trim()) {
+  const userSetAgentId = typeof updates.agentId === 'string' && updates.agentId.trim()
+  if (userSetAgentId) {
     runtimeConfig.agentId = updates.agentId.trim()
   }
 
-  runtimeConfig.costMode = 'free'
+  if (typeof updates.costMode === 'string' && VALID_COST_MODES.has(updates.costMode)) {
+    const prevMode = runtimeConfig.costMode
+    runtimeConfig.costMode = updates.costMode
+    if (!userSetAgentId && updates.costMode !== prevMode) {
+      runtimeConfig.agentId = DEFAULT_AGENT_IDS[updates.costMode]
+    }
+  }
 
   if (typeof updates.backendModel === 'string' && updates.backendModel.trim()) {
     const nextModel = updates.backendModel.trim()
-    const isAllowed = FREE_ALLOWED_BACKEND_MODELS.some(
-      (model) => model.value === nextModel,
-    )
-    if (!isAllowed) {
-      throw Object.assign(
-        new Error(`Unsupported backend model: ${nextModel}`),
-        { statusCode: 400 },
-      )
+    if (runtimeConfig.costMode === 'free') {
+      const isAllowed = FREE_BACKEND_MODELS.some((m) => m.value === nextModel)
+      if (!isAllowed) {
+        throw Object.assign(
+          new Error(`Unsupported backend model for free mode: ${nextModel}`),
+          { statusCode: 400 },
+        )
+      }
     }
     runtimeConfig.backendModel = nextModel
   }
 
-  const next = getRuntimeConfig()
+  const next = await getRuntimeConfig()
   const changed =
     previous.modelAlias !== next.modelAlias ||
     previous.agentId !== next.agentId ||
@@ -309,8 +625,7 @@ async function applyRuntimeConfig(updates = {}) {
     previous.backendModel !== next.backendModel
 
   if (changed) {
-    const auth = resolveAuthState()
-    await finishAllSessions(auth.token, 'cancelled')
+    await finishAllSessions('cancelled')
     bridgeSessions.clear()
   }
 
@@ -877,6 +1192,7 @@ function createBridgeSession(sessionName) {
     session: sessionName,
     clientId: randomUUID(),
     fingerprintId: randomUUID(),
+    accountId: null,
     runId: null,
     costMode: runtimeConfig.costMode,
     agentId: runtimeConfig.agentId,
@@ -921,9 +1237,13 @@ function inspectBridgeSession(sessionName) {
       codebuffMetadata: null,
       lastStopReason: null,
       lastError: null,
+      accountId: null,
+      accountEmail: null,
+      accountSource: null,
     }
   }
 
+  const account = getSessionBoundAccount(session)
   return {
     session: sessionName,
     exists: true,
@@ -935,6 +1255,7 @@ function inspectBridgeSession(sessionName) {
     updatedAt: session.updatedAt,
     lastStopReason: session.lastStopReason,
     lastError: session.lastError,
+    ...getAccountPresentation(account),
   }
 }
 
@@ -999,6 +1320,7 @@ function listSessions() {
     .sort()
     .map((sessionName) => {
       const session = bridgeSessions.get(sessionName)
+      const account = getSessionBoundAccount(session)
       return {
         ...inspectBridgeSession(sessionName),
         usage:
@@ -1010,13 +1332,21 @@ function listSessions() {
             toolCount: 0,
           },
         costMode: session?.costMode || runtimeConfig.costMode,
+        ...getAccountPresentation(account),
       }
     })
 }
 
-function buildAdminOverview() {
-  const auth = resolveAuthState()
+async function buildAdminOverview() {
+  const accounts = listAuthAccounts()
+  const auth = summarizeAuthPool(accounts)
   const sessions = listSessions()
+  const boundSessionCounts = sessions.reduce((counts, session) => {
+    if (session.accountId) {
+      counts.set(session.accountId, (counts.get(session.accountId) || 0) + 1)
+    }
+    return counts
+  }, new Map())
   const recentErrors = usageRecords
     .filter((record) => record.errorSummary)
     .slice(0, 10)
@@ -1042,8 +1372,22 @@ function buildAdminOverview() {
       authenticated: auth.authenticated,
       source: auth.source,
       email: auth.email,
+      totalAccounts: auth.totalAccounts,
+      availableAccounts: auth.availableAccounts,
+      environmentAccountPresent: auth.environmentAccountPresent,
     },
-    config: getRuntimeConfig(),
+    accounts: accounts.map((account) => ({
+      accountId: account.accountId,
+      email: account.email,
+      source: account.source,
+      authenticated: account.authenticated,
+      inPool: account.authenticated && !!account.authToken,
+      readOnly: account.readOnly === true,
+      createdAt: account.createdAt,
+      updatedAt: account.updatedAt,
+      boundSessionCount: boundSessionCounts.get(account.accountId) || 0,
+    })),
+    config: await getRuntimeConfig(),
     sessions,
     compatibility: {
       protocol: 'anthropic-messages',
@@ -1056,6 +1400,11 @@ function buildAdminOverview() {
     usage: {
       summary: buildUsageSummary(),
       records: usageRecords,
+    },
+    login: {
+      pending: Array.from(loginSessions.values()).some(
+        (session) => session && !session.authenticated && !isLoginExpired(session),
+      ),
     },
   }
 }
@@ -1165,6 +1514,19 @@ async function executeCodebuffChatCompletion({
   }
 
   return response
+}
+
+function isAuthenticationFailure(error) {
+  return error?.statusCode === 401 || error?.statusCode === 403
+}
+
+function createMissingCredentialsError() {
+  return Object.assign(
+    new Error(
+      'No Freebuff/Codebuff credentials found. Use /v1/freebuff/login or set CODEBUFF_API_KEY.',
+    ),
+    { statusCode: 401 },
+  )
 }
 
 async function repairToolUse({
@@ -1325,19 +1687,10 @@ function summarizeAnthropicTools(tools) {
 
 async function executeAnthropicRequest({ sessionName, body, headers, url }) {
   return withSessionLock(sessionName, async () => {
-    const auth = resolveAuthState()
-    if (!auth.authenticated || !auth.token) {
-      throw Object.assign(
-        new Error(
-          'No Freebuff/Codebuff credentials found. Use /v1/freebuff/login or set CODEBUFF_API_KEY.',
-        ),
-        { statusCode: 401 },
-      )
-    }
-
     if (shouldResetSession(body, headers)) {
       const previous = bridgeSessions.get(sessionName)
-      await finishSessionRun(auth.token, previous, 'cancelled')
+      const previousAccount = getSessionBoundAccount(previous)
+      await finishSessionRun(previousAccount?.authToken, previous, 'cancelled')
       bridgeSessions.delete(sessionName)
     }
 
@@ -1364,87 +1717,111 @@ async function executeAnthropicRequest({ sessionName, body, headers, url }) {
       tool_choice: openAIToolChoice,
     }
 
-    const response = await executeCodebuffChatCompletion({
-      token: auth.token,
-      session,
-      upstreamBody,
-    })
+    const executeWithAccount = async (account) => {
+      if (!account?.authToken) {
+        throw createMissingCredentialsError()
+      }
 
-    let anthropicMessage = buildAnthropicResponseFromOpenAI(
-      response.data,
-      publicModel,
-    )
-    const repairResult = await repairInvalidToolUses({
-      token: auth.token,
-      session,
-      publicModel,
-      system: body.system,
-      messages: body.messages,
-      tools: body.tools,
-      anthropicMessage,
-    })
-    anthropicMessage = repairResult.message
-    const toolSummary = summarizeAnthropicTools(body.tools)
-    const promptText = [
-      normalizeAnthropicSystem(body.system),
-      JSON.stringify(openAIMessages),
-    ]
-      .filter(Boolean)
-      .join('\n')
-    const responseText = anthropicMessage.content
-      .filter((block) => block.type === 'text')
-      .map((block) => block.text)
-      .join('\n')
+      bindSessionToAccount(session, account)
 
-    session.requestCount += 1
-    session.turns += 1
-    session.updatedAt = new Date().toISOString()
-    session.lastStopReason = anthropicMessage.stop_reason
-    session.lastError = null
-    bridgeSessions.set(sessionName, session)
+      const response = await executeCodebuffChatCompletion({
+        token: account.authToken,
+        session,
+        upstreamBody,
+      })
 
-    recordUsage({
-      id: randomUUID(),
-      createdAt: new Date().toISOString(),
-      session: sessionName,
-      requestKind: 'anthropic',
-      stream: body.stream === true,
-      model: publicModel,
-      agentId: session.agentId,
-      backendModel: runtimeConfig.backendModel,
-      promptTokens: anthropicMessage.usage.input_tokens,
-      outputTokens: anthropicMessage.usage.output_tokens,
-      totalTokens:
-        anthropicMessage.usage.input_tokens + anthropicMessage.usage.output_tokens,
-      promptChars: promptText.length,
-      outputChars: responseText.length,
-      durationMs: Date.now() - requestStartedAt,
-      codebuffMetadata: buildCodebuffMetadata(session),
-      stopReason: anthropicMessage.stop_reason,
-      toolCount: toolSummary.toolCount,
-      toolSources: toolSummary.toolSources,
-      errorSummary: repairResult.repairedCount > 0 ? `Repaired ${repairResult.repairedCount} invalid tool call(s)` : null,
-    })
+      let anthropicMessage = buildAnthropicResponseFromOpenAI(
+        response.data,
+        publicModel,
+      )
+      const repairResult = await repairInvalidToolUses({
+        token: account.authToken,
+        session,
+        publicModel,
+        system: body.system,
+        messages: body.messages,
+        tools: body.tools,
+        anthropicMessage,
+      })
+      anthropicMessage = repairResult.message
+      const toolSummary = summarizeAnthropicTools(body.tools)
+      const promptText = [
+        normalizeAnthropicSystem(body.system),
+        JSON.stringify(openAIMessages),
+      ]
+        .filter(Boolean)
+        .join('\n')
+      const responseText = anthropicMessage.content
+        .filter((block) => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n')
 
-    return anthropicMessage
+      session.requestCount += 1
+      session.turns += 1
+      session.updatedAt = new Date().toISOString()
+      session.lastStopReason = anthropicMessage.stop_reason
+      session.lastError = null
+      bridgeSessions.set(sessionName, session)
+
+      recordUsage({
+        id: randomUUID(),
+        createdAt: new Date().toISOString(),
+        session: sessionName,
+        requestKind: 'anthropic',
+        stream: body.stream === true,
+        model: publicModel,
+        agentId: session.agentId,
+        backendModel: runtimeConfig.backendModel,
+        promptTokens: anthropicMessage.usage.input_tokens,
+        outputTokens: anthropicMessage.usage.output_tokens,
+        totalTokens:
+          anthropicMessage.usage.input_tokens +
+          anthropicMessage.usage.output_tokens,
+        promptChars: promptText.length,
+        outputChars: responseText.length,
+        durationMs: Date.now() - requestStartedAt,
+        codebuffMetadata: buildCodebuffMetadata(session),
+        stopReason: anthropicMessage.stop_reason,
+        toolCount: toolSummary.toolCount,
+        toolSources: toolSummary.toolSources,
+        errorSummary:
+          repairResult.repairedCount > 0
+            ? `Repaired ${repairResult.repairedCount} invalid tool call(s)`
+            : null,
+        ...getAccountPresentation(account),
+      })
+
+      return anthropicMessage
+    }
+
+    const account = ensureSessionAccount(session)
+    if (!account) {
+      throw createMissingCredentialsError()
+    }
+
+    try {
+      return await executeWithAccount(account)
+    } catch (error) {
+      if (!isAuthenticationFailure(error)) {
+        throw error
+      }
+
+      const retryAccount = ensureSessionAccount(session, [account.accountId])
+      if (!retryAccount) {
+        throw error
+      }
+
+      return executeWithAccount(retryAccount)
+    }
   })
 }
 
 async function executeOpenAIRequest({ sessionName, body, headers }) {
   return withSessionLock(sessionName, async () => {
-    const auth = resolveAuthState()
-    if (!auth.authenticated || !auth.token) {
-      throw Object.assign(
-        new Error(
-          'No Freebuff/Codebuff credentials found. Use /v1/freebuff/login or set CODEBUFF_API_KEY.',
-        ),
-        { statusCode: 401 },
-      )
-    }
-
     if (shouldResetSession(body, headers)) {
       const previous = bridgeSessions.get(sessionName)
-      await finishSessionRun(auth.token, previous, 'cancelled')
+      const previousAccount = getSessionBoundAccount(previous)
+      await finishSessionRun(previousAccount?.authToken, previous, 'cancelled')
       bridgeSessions.delete(sessionName)
     }
 
@@ -1463,44 +1840,76 @@ async function executeOpenAIRequest({ sessionName, body, headers }) {
       codebuff_metadata: undefined,
     }
 
-    const response = await executeCodebuffChatCompletion({
-      token: auth.token,
-      session,
-      upstreamBody,
-    })
+    const executeWithAccount = async (account) => {
+      if (!account?.authToken) {
+        throw createMissingCredentialsError()
+      }
 
-    const usage = response.data?.usage || {}
-    const toolCalls = response.data?.choices?.[0]?.message?.tool_calls || []
-    session.requestCount += 1
-    session.turns += 1
-    session.updatedAt = new Date().toISOString()
-    session.lastStopReason = response.data?.choices?.[0]?.finish_reason || 'stop'
-    session.lastError = null
-    bridgeSessions.set(sessionName, session)
+      bindSessionToAccount(session, account)
 
-    recordUsage({
-      id: randomUUID(),
-      createdAt: new Date().toISOString(),
-      session: sessionName,
-      requestKind: 'openai',
-      stream: body.stream === true,
-      model: publicModel,
-      agentId: session.agentId,
-      backendModel: runtimeConfig.backendModel,
-      promptTokens: usage.prompt_tokens || 0,
-      outputTokens: usage.completion_tokens || 0,
-      totalTokens: usage.total_tokens || 0,
-      promptChars: JSON.stringify(body.messages || []).length,
-      outputChars: normalizeText(response.data?.choices?.[0]?.message?.content).length,
-      durationMs: Date.now() - requestStartedAt,
-      codebuffMetadata: buildCodebuffMetadata(session),
-      stopReason: response.data?.choices?.[0]?.finish_reason || 'stop',
-      toolCount: Array.isArray(toolCalls) ? toolCalls.length : 0,
-      toolSources: [],
-      errorSummary: null,
-    })
+      const response = await executeCodebuffChatCompletion({
+        token: account.authToken,
+        session,
+        upstreamBody,
+      })
 
-    return buildCompletionResponse(publicModel, response.data)
+      const usage = response.data?.usage || {}
+      const toolCalls = response.data?.choices?.[0]?.message?.tool_calls || []
+      session.requestCount += 1
+      session.turns += 1
+      session.updatedAt = new Date().toISOString()
+      session.lastStopReason =
+        response.data?.choices?.[0]?.finish_reason || 'stop'
+      session.lastError = null
+      bridgeSessions.set(sessionName, session)
+
+      recordUsage({
+        id: randomUUID(),
+        createdAt: new Date().toISOString(),
+        session: sessionName,
+        requestKind: 'openai',
+        stream: body.stream === true,
+        model: publicModel,
+        agentId: session.agentId,
+        backendModel: runtimeConfig.backendModel,
+        promptTokens: usage.prompt_tokens || 0,
+        outputTokens: usage.completion_tokens || 0,
+        totalTokens: usage.total_tokens || 0,
+        promptChars: JSON.stringify(body.messages || []).length,
+        outputChars: normalizeText(
+          response.data?.choices?.[0]?.message?.content,
+        ).length,
+        durationMs: Date.now() - requestStartedAt,
+        codebuffMetadata: buildCodebuffMetadata(session),
+        stopReason: response.data?.choices?.[0]?.finish_reason || 'stop',
+        toolCount: Array.isArray(toolCalls) ? toolCalls.length : 0,
+        toolSources: [],
+        errorSummary: null,
+        ...getAccountPresentation(account),
+      })
+
+      return buildCompletionResponse(publicModel, response.data)
+    }
+
+    const account = ensureSessionAccount(session)
+    if (!account) {
+      throw createMissingCredentialsError()
+    }
+
+    try {
+      return await executeWithAccount(account)
+    } catch (error) {
+      if (!isAuthenticationFailure(error)) {
+        throw error
+      }
+
+      const retryAccount = ensureSessionAccount(session, [account.accountId])
+      if (!retryAccount) {
+        throw error
+      }
+
+      return executeWithAccount(retryAccount)
+    }
   })
 }
 
@@ -1660,6 +2069,9 @@ function createLoginSession(sessionName) {
     fingerprintHash: null,
     expiresAt: null,
     loginUrl: null,
+    authenticated: false,
+    accountId: null,
+    email: null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   }
@@ -1698,6 +2110,9 @@ async function startLoginSession(sessionName, forceReset = false) {
         : null,
     loginUrl:
       typeof response.data.loginUrl === 'string' ? response.data.loginUrl : null,
+    authenticated: false,
+    accountId: null,
+    email: null,
     updatedAt: new Date().toISOString(),
   }
 
@@ -1771,11 +2186,15 @@ async function pollLoginSession(sessionName) {
     }
   }
 
-  saveUserCredentials({
-    ...user,
-    fingerprintId: session.fingerprintId,
-    fingerprintHash: session.fingerprintHash,
-  })
+  const account = upsertStoredAccount(user, session)
+  const completedSession = {
+    ...session,
+    authenticated: true,
+    accountId: account.accountId,
+    email: account.email,
+    updatedAt: new Date().toISOString(),
+  }
+  loginSessions.set(sessionName, completedSession)
 
   return {
     ok: true,
@@ -1785,8 +2204,9 @@ async function pollLoginSession(sessionName) {
     session: sessionName,
     loginUrl: session.loginUrl,
     expiresAt: session.expiresAt,
-    email: typeof user.email === 'string' ? user.email : null,
-    source: 'credentials',
+    email: account.email,
+    accountId: account.accountId,
+    source: account.source,
   }
 }
 
@@ -1812,14 +2232,22 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && url.pathname === '/v1/freebuff/admin/overview') {
-      sendJson(res, 200, buildAdminOverview())
+      sendJson(res, 200, await buildAdminOverview())
+      return
+    }
+
+    if (req.method === 'GET' && url.pathname === '/v1/freebuff/models') {
+      const mode = url.searchParams.get('costMode') || runtimeConfig.costMode
+      const models =
+        mode === 'free' ? FREE_BACKEND_MODELS : await getOpenRouterModels()
+      sendJson(res, 200, { ok: true, models })
       return
     }
 
     if (req.method === 'GET' && url.pathname === '/v1/freebuff/config') {
       sendJson(res, 200, {
         ok: true,
-        config: getRuntimeConfig(),
+        config: await getRuntimeConfig(),
       })
       return
     }
@@ -1852,17 +2280,51 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/freebuff/logout') {
-      const auth = resolveAuthState()
-      await finishAllSessions(auth.token, 'cancelled')
+      const body = await readJsonBody(req)
+      const accountId = firstNonEmpty(body?.accountId, req.headers['x-freebuff-account'])
+      if (!accountId) {
+        throw Object.assign(new Error('accountId is required.'), {
+          statusCode: 400,
+        })
+      }
+
+      const account = getAccountById(accountId)
+      if (!account) {
+        throw Object.assign(new Error(`Account not found: ${accountId}`), {
+          statusCode: 404,
+        })
+      }
+
+      if (account.source === 'environment') {
+        throw Object.assign(
+          new Error('Environment-backed account cannot be removed from the dashboard.'),
+          { statusCode: 400 },
+        )
+      }
+
+      await releaseSessionsForAccount(accountId, 'cancelled')
+      clearLoginSessionsForAccount(accountId)
+      removeStoredAccount(accountId)
+      sendJson(res, 200, {
+        ok: true,
+        loggedOut: true,
+        accountId,
+      })
+      return
+    }
+
+    if (req.method === 'POST' && url.pathname === '/v1/freebuff/logout/all') {
+      await finishAllSessions('cancelled')
       bridgeSessions.clear()
-      clearUserCredentials()
-      sendJson(res, 200, { ok: true, loggedOut: true })
+      loginSessions.clear()
+      writeStoredAccounts([])
+      sendJson(res, 200, { ok: true, loggedOutAll: true })
       return
     }
 
     if (req.method === 'GET' && url.pathname === '/health') {
-      const auth = resolveAuthState()
       const sessionName = resolveSessionName({}, req.headers, url)
+      const auth = buildAuthPresentation(sessionName)
       sendJson(res, 200, {
         ok: true,
         host: CONFIG.host,
@@ -1873,8 +2335,14 @@ const server = createServer(async (req, res) => {
         backendModel: runtimeConfig.backendModel,
         costMode: runtimeConfig.costMode,
         authenticated: auth.authenticated,
-        authSource: auth.source,
+        authSource: auth.authSource,
         email: auth.email,
+        accountId: auth.boundAccountId,
+        authPool: {
+          totalAccounts: auth.totalAccounts,
+          availableAccounts: auth.availableAccounts,
+          environmentAccountPresent: auth.environmentAccountPresent,
+        },
         bridgeSessions: bridgeSessions.size,
         compatibility: {
           protocol: 'anthropic-messages',
@@ -1888,16 +2356,23 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && url.pathname === '/v1/freebuff/status') {
-      const auth = resolveAuthState()
       const sessionName = resolveSessionName({}, req.headers, url)
+      const auth = buildAuthPresentation(sessionName)
       sendJson(res, 200, {
         ok: true,
         cwd: CONFIG.cwd,
         authenticated: auth.authenticated,
-        authSource: auth.source,
+        authSource: auth.authSource,
         email: auth.email,
-        config: getRuntimeConfig(),
+        accountId: auth.boundAccountId,
+        authPool: {
+          totalAccounts: auth.totalAccounts,
+          availableAccounts: auth.availableAccounts,
+          environmentAccountPresent: auth.environmentAccountPresent,
+        },
+        config: await getRuntimeConfig(),
         usageSummary: buildUsageSummary(),
+        accounts: (await buildAdminOverview()).accounts,
         sessions: listSessions(),
         compatibility: {
           protocol: 'anthropic-messages',
@@ -1912,10 +2387,10 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'POST' && url.pathname === '/v1/freebuff/reset') {
       const body = await readJsonBody(req)
-      const auth = resolveAuthState()
       const sessionName = resolveSessionName(body, req.headers, url)
       const session = bridgeSessions.get(sessionName)
-      await finishSessionRun(auth.token, session, 'cancelled')
+      const account = getSessionBoundAccount(session)
+      await finishSessionRun(account?.authToken, session, 'cancelled')
       bridgeSessions.delete(sessionName)
       sendJson(res, 200, { ok: true, session: sessionName, reset: true })
       return
@@ -1936,6 +2411,7 @@ const server = createServer(async (req, res) => {
         ok: true,
         session: sessionName,
         authenticated: resolveAuthState().authenticated,
+        availableAccounts: resolveAuthState().availableAccounts,
         loginUrl: loginSession.loginUrl,
         fingerprintId: loginSession.fingerprintId,
         expiresAt: loginSession.expiresAt,
