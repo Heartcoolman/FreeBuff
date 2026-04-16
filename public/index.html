@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Freebuff 桥接控制台</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <div class="background-grid"></div>
+    <main class="shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">本地管理面板</p>
+          <h1>Freebuff 桥接控制台</h1>
+          <p class="hero-copy">
+            统一管理账号状态、运行模型配置、会话状态和 Token 使用记录。
+          </p>
+        </div>
+        <div class="hero-actions">
+          <button id="refresh-all" class="button button-primary">刷新面板</button>
+          <div class="auto-refresh-wrap">
+            <span>自动刷新</span>
+            <select id="auto-refresh-select">
+              <option value="0">关闭</option>
+              <option value="15">15 秒</option>
+              <option value="30">30 秒</option>
+              <option value="60">60 秒</option>
+            </select>
+          </div>
+          <a class="button button-ghost" href="/health" target="_blank" rel="noreferrer">健康检查</a>
+        </div>
+      </header>
+
+      <section class="grid two-up">
+        <article class="panel panel-accent">
+          <div class="panel-head">
+            <div>
+              <p class="label">账号</p>
+              <h2>登录与凭据</h2>
+            </div>
+            <span id="auth-pill" class="pill">检查中</span>
+          </div>
+          <dl class="meta-list" id="auth-meta">
+            <div>
+              <dt>邮箱</dt>
+              <dd id="auth-email">-</dd>
+            </div>
+            <div>
+              <dt>来源</dt>
+              <dd id="auth-source">-</dd>
+            </div>
+          </dl>
+          <div id="login-actions"></div>
+          <div id="login-url-box" style="margin-top: 14px;"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="label">运行时</p>
+              <h2>模型与 Agent</h2>
+            </div>
+            <span class="pill pill-soft">保存后会清空现有会话</span>
+          </div>
+          <form id="config-form" class="stack">
+            <label class="field">
+              <span>Claude 侧模型别名</span>
+              <input id="config-model-alias" name="modelAlias" type="text" />
+            </label>
+            <label class="field">
+              <span>桥接 Agent ID</span>
+              <input id="config-agent-id" name="agentId" type="text" />
+            </label>
+            <label class="field">
+              <span>后端模型</span>
+              <select id="config-backend-model" name="backendModel"></select>
+            </label>
+            <label class="field">
+              <span>计费模式</span>
+              <select id="config-cost-mode" name="costMode" disabled>
+                <option value="free">free</option>
+              </select>
+              <p class="muted" style="margin: 4px 0 0;">当前桥仅保留 Free 模式。</p>
+            </label>
+            <div class="button-row">
+              <button type="submit" class="button button-primary">保存运行配置</button>
+            </div>
+          </form>
+        </article>
+      </section>
+
+      <section class="grid metrics" id="summary-cards"></section>
+
+      <section class="grid two-up">
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="label">兼容状态</p>
+              <h2>Claude Code 工具协议</h2>
+            </div>
+          </div>
+          <div id="compatibility-card" class="stack compact"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="label">会话</p>
+              <h2>当前桥接会话</h2>
+            </div>
+          </div>
+          <div id="sessions-list" class="stack compact"></div>
+        </article>
+      </section>
+
+      <section class="grid">
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="label">使用记录</p>
+              <h2>Token 统计</h2>
+            </div>
+            <div class="button-row">
+              <button id="refresh-usage" class="button button-ghost">刷新</button>
+              <button id="reset-usage" class="button button-danger">清空历史</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>会话</th>
+                  <th>类型</th>
+                  <th>模型</th>
+                  <th>输入</th>
+                  <th>输出</th>
+                  <th>总计</th>
+                  <th>工具数</th>
+                  <th>停止原因</th>
+                  <th>延迟</th>
+                  <th>Token/秒</th>
+                </tr>
+              </thead>
+              <tbody id="usage-table"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <section class="grid">
+        <article class="panel panel-accent">
+          <div class="panel-head">
+            <div>
+              <p class="label">教程</p>
+              <h2>如何接入 Claude Code</h2>
+            </div>
+            <span class="pill pill-soft">按顺序操作</span>
+          </div>
+          <div class="tutorial-grid">
+            <div class="callout">
+              <p class="callout-title">1. 启动桥接服务</p>
+              <pre class="code-block"><code>cd /Users/liji/FreeBuff
+npm start</code></pre>
+              <p class="muted">保持这个进程运行，默认监听 `http://127.0.0.1:8765`。</p>
+            </div>
+
+            <div class="callout">
+              <p class="callout-title">2. 给 Claude Code 配环境变量</p>
+              <pre class="code-block"><code>export ANTHROPIC_BASE_URL=http://127.0.0.1:8765
+export ANTHROPIC_API_KEY=dummy</code></pre>
+              <p class="muted">`ANTHROPIC_API_KEY` 这里只是占位，真正鉴权走本地 Freebuff/Codebuff 凭据。</p>
+            </div>
+
+            <div class="callout">
+              <p class="callout-title">3. 在 Claude Code 里使用这个模型</p>
+              <pre class="code-block"><code id="tutorial-model-command">claude --model freebuff-bridge</code></pre>
+              <p class="muted">当前推荐模型别名：<strong id="tutorial-model-alias">freebuff-bridge</strong></p>
+            </div>
+
+            <div class="callout">
+              <p class="callout-title">4. 持久化到 Claude Code 配置</p>
+              <pre class="code-block"><code id="tutorial-settings-json"></code></pre>
+              <p class="muted">可写到 `~/.claude/settings.json` 或你自己的项目级 Claude Code 配置里。</p>
+            </div>
+
+            <div class="callout">
+              <p class="callout-title">5. 第一次使用前先确认登录</p>
+              <p class="muted">如果上面的账号区域显示未登录，先点"开始登录"，浏览器完成 Freebuff 官方登录后，再点"检查登录状态"。</p>
+            </div>
+
+            <div class="callout">
+              <p class="callout-title">6. 验证是否接通</p>
+              <pre class="code-block"><code>curl http://127.0.0.1:8765/health</code></pre>
+              <p class="muted">只要 `authenticated: true`，Claude Code 就可以通过这个桥使用 Freebuff 侧能力。</p>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <p id="toast" class="toast" aria-live="polite"></p>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
