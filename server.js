@@ -21,10 +21,35 @@ const CONFIG = {
   loginBaseUrl: process.env.FREEBUFF_LOGIN_BASE_URL || 'https://freebuff.com',
   apiBaseUrl: process.env.FREEBUFF_API_BASE_URL || 'https://www.codebuff.com',
   usageHistoryLimit: Number(process.env.FREEBUFF_USAGE_HISTORY_LIMIT || 500),
+  allowPaidModeFallback:
+    process.env.FREEBUFF_ALLOW_PAID_MODE_FALLBACK === '1' ||
+    process.env.FREEBUFF_ALLOW_PAID_MODE_FALLBACK === 'true',
 }
 
 const APP_DIR = path.dirname(fileURLToPath(import.meta.url))
 const PUBLIC_DIR = path.join(APP_DIR, 'public')
+
+// --- Structured logger ---
+const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 }
+const LOG_LEVEL = LOG_LEVELS[process.env.FREEBUFF_LOG_LEVEL?.toLowerCase()] ?? LOG_LEVELS.info
+
+function log(level, component, msg, fields = null) {
+  if (LOG_LEVELS[level] < LOG_LEVEL) return
+  const entry = { ts: new Date().toISOString(), level, component, msg }
+  if (fields) {
+    for (const [k, v] of Object.entries(fields)) {
+      if (v !== undefined && v !== null) entry[k] = v
+    }
+  }
+  process.stdout.write(JSON.stringify(entry) + '\n')
+}
+
+const logger = {
+  debug: (component, msg, fields) => log('debug', component, msg, fields),
+  info:  (component, msg, fields) => log('info', component, msg, fields),
+  warn:  (component, msg, fields) => log('warn', component, msg, fields),
+  error: (component, msg, fields) => log('error', component, msg, fields),
+}
 
 const MODE_DEFINITIONS = {
   free: {
@@ -102,6 +127,7 @@ const runtimeConfig = {
   agentId: CONFIG.defaultAgentId || getAgentIdForMode(initialMode),
   costMode: initialMode,
   backendModel: process.env.FREEBUFF_BACKEND_MODEL || 'z-ai/glm-5.1',
+  allowPaidModeFallback: CONFIG.allowPaidModeFallback,
 }
 
 const FREE_BACKEND_MODELS = [
@@ -145,6 +171,141 @@ const usageRecords = []
 const accountRuntimeStats = new Map()
 let accountRotationCursor = 0
 
+// --- Backend connectivity & account liveness cache ---
+const serverStartTime = Date.now()
+const HEALTH_CACHE_TTL = 60_000
+const backendLiveness = { checkedAt: 0, ok: false, latencyMs: 0, status: null, error: null }
+const accountLivenessCache = new Map() // accountId -> { checkedAt, ok, latencyMs, status, error }
+
+async function probeBackendConnectivity() {
+  const now = Date.now()
+  if (now - backendLiveness.checkedAt < HEALTH_CACHE_TTL) return backendLiveness
+  const startedAt = now
+  try {
+    const res = await fetch(`${CONFIG.apiBaseUrl}/api/v1/agent-runs`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'START', agentId: 'health-probe', ancestorRunIds: [] }),
+      signal: AbortSignal.timeout(10_000),
+    })
+    backendLiveness.checkedAt = Date.now()
+    backendLiveness.ok = res.ok || res.status === 401 || res.status === 403
+    backendLiveness.latencyMs = backendLiveness.checkedAt - startedAt
+    backendLiveness.status = res.status
+    backendLiveness.error = null
+  } catch (err) {
+    backendLiveness.checkedAt = Date.now()
+    backendLiveness.ok = false
+    backendLiveness.latencyMs = backendLiveness.checkedAt - startedAt
+    backendLiveness.status = null
+    backendLiveness.error = err?.message || String(err)
+  }
+  return backendLiveness
+}
+
+async function probeAccountLiveness(account) {
+  const now = Date.now()
+  const cached = accountLivenessCache.get(account.accountId)
+  if (cached && now - cached.checkedAt < HEALTH_CACHE_TTL) return cached
+  const startedAt = now
+  try {
+    const res = await fetch(`${CONFIG.apiBaseUrl}/api/v1/agent-runs`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        Authorization: `Bearer ${account.authToken}`,
+        'x-codebuff-api-key': account.authToken,
+      },
+      body: JSON.stringify({ action: 'START', agentId: 'health-probe', ancestorRunIds: [] }),
+      signal: AbortSignal.timeout(10_000),
+    })
+    // 200 = valid, 401/403 = token invalid, other = still reachable
+    const ok = res.status !== 401 && res.status !== 403
+    let text = ''
+    try { text = await res.text() } catch {}
+    const result = { checkedAt: Date.now(), ok, latencyMs: Date.now() - startedAt, status: res.status, error: ok ? null : `HTTP ${res.status}` }
+    accountLivenessCache.set(account.accountId, result)
+    return result
+  } catch (err) {
+    const result = { checkedAt: Date.now(), ok: false, latencyMs: Date.now() - startedAt, status: null, error: err?.message || String(err) }
+    accountLivenessCache.set(account.accountId, result)
+    return result
+  }
+}
+
+function buildSystemMetrics() {
+  const mem = process.memoryUsage()
+  return {
+    uptimeSeconds: Math.round((Date.now() - serverStartTime) / 1000),
+    memory: { rss: mem.rss, heapTotal: mem.heapTotal, heapUsed: mem.heapUsed, external: mem.external },
+    pid: process.pid,
+    nodeVersion: process.version,
+  }
+}
+
+function buildAccountPoolHealth(now = Date.now()) {
+  const accounts = listAuthAccounts()
+  const available = listAvailableAccounts()
+  let coolingDown = 0
+  const modeUnavailability = {}
+  const accountSummaries = accounts.map((acct) => {
+    const stats = accountRuntimeStats.get(acct.accountId)
+    const isCoolingDown = stats?.cooldownUntilMs && stats.cooldownUntilMs > now
+    if (isCoolingDown) coolingDown += 1
+    const modes = stats?.unavailableModes || {}
+    const unavailableModeCount = Object.keys(modes).length
+    for (const mode of Object.keys(modes)) {
+      modeUnavailability[mode] = (modeUnavailability[mode] || 0) + 1
+    }
+    return {
+      accountId: acct.accountId,
+      email: acct.email,
+      ok: acct.authenticated && !isCoolingDown,
+      isCoolingDown: Boolean(isCoolingDown),
+      unavailableModeCount,
+      lastFailureReason: stats?.lastFailureReason || null,
+    }
+  })
+  const recent = usageRecords.slice(0, 20)
+  const errorCount = recent.filter((r) => r.errorSummary).length
+  const recentErrorRate = recent.length > 0 ? Math.round((errorCount / recent.length) * 100) : 0
+  return {
+    totalAccounts: accounts.length,
+    availableAccounts: available.length,
+    coolingDownAccounts: coolingDown,
+    modeUnavailability,
+    recentErrorRate,
+    accounts: accountSummaries,
+  }
+}
+
+function computeHealthStatus(opts = {}) {
+  const { backendOk, backendCacheFresh } = opts
+  const accounts = listAuthAccounts()
+  const available = listAvailableAccounts()
+  const anyAuthenticated = accounts.some((a) => a.authenticated)
+
+  if (!anyAuthenticated) return 'unhealthy'
+  if (backendOk === false) return 'unhealthy'
+  if (available.length === 0) return 'unhealthy'
+
+  const now = Date.now()
+  const allCoolingDown = accounts.every((acct) => {
+    const stats = accountRuntimeStats.get(acct.accountId)
+    return stats?.cooldownUntilMs && stats.cooldownUntilMs > now
+  })
+  if (allCoolingDown) return 'unhealthy'
+
+  // degraded conditions
+  if (backendOk == null && !backendCacheFresh) return 'degraded'
+  const pool = buildAccountPoolHealth(now)
+  if (pool.recentErrorRate > 30) return 'degraded'
+  if (pool.coolingDownAccounts > 0) return 'degraded'
+  if (available.length < accounts.length && accounts.length > 1) return 'degraded'
+
+  return 'healthy'
+}
+
 const ACCOUNT_STATS_WINDOW = 5
 const ACCOUNT_COOLDOWN_MS = 45_000
 const ACCOUNT_SELECTION_RECENCY_MS = 12_000
@@ -152,11 +313,11 @@ const ACCOUNT_SLOW_TPS_THRESHOLD = 8
 const ACCOUNT_SLOW_DURATION_MS = 7_500
 
 process.on('uncaughtException', (error) => {
-  console.error('[freebuff-bridge] uncaughtException', error)
+  logger.error('process', 'uncaughtException', { error: error?.message, stack: error?.stack })
 })
 
 process.on('unhandledRejection', (error) => {
-  console.error('[freebuff-bridge] unhandledRejection', error)
+  logger.error('process', 'unhandledRejection', { error: error?.message, stack: error?.stack })
 })
 
 function firstNonEmpty(...values) {
@@ -457,6 +618,7 @@ function getOrCreateAccountRuntimeStats(accountId) {
       lastSuccessAtMs: 0,
       lastFailureAtMs: 0,
       lastFailureReason: null,
+      lastFailureLevel: null,
       cooldownUntilMs: 0,
       consecutiveSlowCount: 0,
     }
@@ -517,6 +679,7 @@ function buildAccountRuntimeSummary(accountId, now = Date.now()) {
       : null,
     lastFailureAtMs: stats?.lastFailureAtMs || 0,
     lastFailureReason: stats?.lastFailureReason || null,
+    lastFailureLevel: stats?.lastFailureLevel || null,
     cooldownUntil:
       stats?.cooldownUntilMs && stats.cooldownUntilMs > 0
         ? new Date(stats.cooldownUntilMs).toISOString()
@@ -563,6 +726,7 @@ function markAccountSuccess(
 
   stats.lastSuccessAtMs = now
   stats.lastFailureReason = null
+  stats.lastFailureLevel = null
   stats.cooldownUntilMs = 0
   if (mode) {
     delete stats.unavailableModes?.[mode]
@@ -580,6 +744,7 @@ function markAccountFailure(
   accountId,
   reason = 'request_failed',
   cooldownMs = ACCOUNT_COOLDOWN_MS,
+  level = 'retryable',
 ) {
   const stats = getOrCreateAccountRuntimeStats(accountId)
   if (!stats) {
@@ -589,6 +754,7 @@ function markAccountFailure(
   const now = Date.now()
   stats.lastFailureAtMs = now
   stats.lastFailureReason = reason
+  stats.lastFailureLevel = level
   stats.cooldownUntilMs = cooldownMs > 0 ? now + cooldownMs : 0
 
   return buildAccountRuntimeSummary(accountId, now)
@@ -611,9 +777,14 @@ function markAccountModeUnavailable(accountId, mode, reason = 'mode_unavailable'
   }
   stats.lastFailureAtMs = now
   stats.lastFailureReason = reason
+  stats.lastFailureLevel = 'blocking'
   stats.cooldownUntilMs = 0
 
   return buildAccountRuntimeSummary(accountId, now)
+}
+
+function markAccountBlocked(accountId, reason = 'request_blocked') {
+  return markAccountFailure(accountId, reason, 0, 'blocking')
 }
 
 function isAccountModeUnavailable(accountId, mode) {
@@ -835,6 +1006,7 @@ async function getRuntimeConfig() {
     agentId: runtimeConfig.agentId,
     costMode: mode,
     backendModel: runtimeConfig.backendModel,
+    allowPaidModeFallback: runtimeConfig.allowPaidModeFallback === true,
     availableBackendModels,
   }
 }
@@ -897,6 +1069,7 @@ async function assignSessionToAccount(session, account, reason = null) {
   const previousAccount = getSessionBoundAccount(session)
   const switched = previousAccount?.accountId !== account.accountId
   if (switched && previousAccount) {
+    logger.info('session', 'account switched', { session: session.session, from: previousAccount.accountId, to: account.accountId, reason })
     await finishSessionRun(previousAccount.authToken, session, 'cancelled')
     resetSessionRunState(session, reason || 'Account switched.')
   }
@@ -968,7 +1141,7 @@ async function finishSessionRun(authToken, session, status = 'cancelled') {
       signal: AbortSignal.timeout(15_000),
     })
   } catch (error) {
-    console.error('[freebuff-bridge] finishSessionRun failed', error)
+    logger.error('session', 'finishSessionRun failed', { runId: session.runId, error: error?.message })
   }
 }
 
@@ -1020,14 +1193,29 @@ async function applyRuntimeConfig(updates = {}) {
     runtimeConfig.backendModel = nextModel
   }
 
+  if (updates.allowPaidModeFallback != null) {
+    runtimeConfig.allowPaidModeFallback =
+      updates.allowPaidModeFallback === true ||
+      updates.allowPaidModeFallback === 'true' ||
+      updates.allowPaidModeFallback === '1'
+  }
+
   const next = await getRuntimeConfig()
   const changed =
     previous.modelAlias !== next.modelAlias ||
     previous.mode !== next.mode ||
     previous.agentId !== next.agentId ||
-    previous.backendModel !== next.backendModel
+    previous.backendModel !== next.backendModel ||
+    previous.allowPaidModeFallback !== next.allowPaidModeFallback
 
   if (changed) {
+    logger.info('config', 'runtime config changed, resetting sessions', {
+      modelAlias: `${previous.modelAlias} -> ${next.modelAlias}`,
+      mode: `${previous.mode} -> ${next.mode}`,
+      agentId: `${previous.agentId} -> ${next.agentId}`,
+      backendModel: `${previous.backendModel} -> ${next.backendModel}`,
+      allowPaidModeFallback: `${previous.allowPaidModeFallback} -> ${next.allowPaidModeFallback}`,
+    })
     await finishAllSessions('cancelled')
     bridgeSessions.clear()
   }
@@ -1994,6 +2182,7 @@ function getOrCreateBridgeSession(sessionName) {
   if (!session) {
     session = createBridgeSession(sessionName)
     bridgeSessions.set(sessionName, session)
+    logger.info('session', 'created', { session: sessionName })
   }
   return session
 }
@@ -2316,6 +2505,7 @@ function mapOpenAIFinishReason(reason) {
 }
 
 async function startAgentRun(token, agentId) {
+  const startedAt = Date.now()
   const response = await callCodebuffJson(token, '/api/v1/agent-runs', {
     action: 'START',
     agentId,
@@ -2323,11 +2513,13 @@ async function startAgentRun(token, agentId) {
   })
 
   if (!response.ok || typeof response.data?.runId !== 'string') {
+    logger.error('codebuff', 'startAgentRun failed', { agentId, status: response.status, durationMs: Date.now() - startedAt })
     throw Object.assign(new Error(response.data?.error || 'Failed to create agent run.'), {
       statusCode: response.status || 500,
     })
   }
 
+  logger.info('codebuff', 'agent run started', { agentId, runId: response.data.runId, durationMs: Date.now() - startedAt })
   return response.data.runId
 }
 
@@ -2363,6 +2555,7 @@ async function executeCodebuffChatCompletion({
   })
 
   if (!response.ok && isInvalidRunError(response)) {
+    logger.warn('codebuff', 'invalid run, restarting', { session: session.session, runId: session.runId })
     await finishSessionRun(token, session, 'cancelled')
     session.runId = await startAgentRun(token, session.agentId)
     session.updatedAt = new Date().toISOString()
@@ -2410,6 +2603,10 @@ function getFallbackModeForSession(session, error = null) {
 }
 
 function shouldFallbackSessionMode(session, error = null) {
+  if (runtimeConfig.allowPaidModeFallback !== true) {
+    return false
+  }
+
   const currentMode = session?.costMode || runtimeConfig.costMode
   if (!getFallbackModeForSession(session, error)) {
     return false
@@ -2456,6 +2653,33 @@ function createMissingCredentialsError() {
     ),
     { statusCode: 401 },
   )
+}
+
+function createNoEligibleAccountsError(session, excludedAccountIds = []) {
+  const availableAccounts = listAvailableAccounts(excludedAccountIds)
+  if (availableAccounts.length === 0) {
+    return createMissingCredentialsError()
+  }
+
+  const mode = session?.costMode || runtimeConfig.costMode
+  const modeUnavailableReasons = availableAccounts
+    .map((account) => accountRuntimeStats.get(account.accountId)?.unavailableModes?.[mode]?.reason)
+    .filter(Boolean)
+
+  if (modeUnavailableReasons.length === availableAccounts.length) {
+    return Object.assign(
+      new Error(
+        modeUnavailableReasons[0] ||
+          `${MODE_DEFINITIONS[mode]?.label || mode} mode is unavailable for all available accounts.`,
+      ),
+      {
+        statusCode: 403,
+        errorCode: `${mode}_mode_unavailable`,
+      },
+    )
+  }
+
+  return createMissingCredentialsError()
 }
 
 async function repairToolUse({
@@ -2627,6 +2851,7 @@ async function executeWithAccountSelectionRecovery(session, executeSelection) {
     if (!selection?.account) {
       if (!attemptedModeFallback && shouldFallbackSessionMode(session, lastError)) {
         const nextMode = getFallbackModeForSession(session, lastError)
+        logger.info('account', 'mode fallback', { session: session.session, from: session.costMode, to: nextMode, reason: lastError?.message })
         await fallbackSessionMode(
           session,
           `Mode fallback: ${session.costMode} -> ${nextMode} (${lastError?.message || 'mode unavailable'})`,
@@ -2638,7 +2863,11 @@ async function executeWithAccountSelectionRecovery(session, executeSelection) {
         continue
       }
 
-      throw lastError || createMissingCredentialsError()
+      throw lastError || createNoEligibleAccountsError(session, excludedAccountIds)
+    }
+
+    if (attempt > 0) {
+      logger.info('account', 'retry attempt', { session: session.session, attempt, accountId: selection.account.accountId, strategy })
     }
 
     try {
@@ -2648,10 +2877,17 @@ async function executeWithAccountSelectionRecovery(session, executeSelection) {
       bridgeSessions.set(session.session, session)
 
       if (!isRetryableAccountFailure(error)) {
+        markAccountBlocked(
+          selection.account.accountId,
+          error?.message || `http_${error?.statusCode || 'error'}`,
+        )
+        logger.error('account', 'non-retryable failure', { session: session.session, accountId: selection.account.accountId, statusCode: error?.statusCode, error: error?.message })
         throw error
       }
 
       const activeMode = session.costMode || runtimeConfig.costMode
+      logger.warn('account', 'retryable failure', { session: session.session, attempt, accountId: selection.account.accountId, statusCode: error?.statusCode, error: error?.message })
+
       if (isModeUnavailableError(error, activeMode)) {
         markAccountModeUnavailable(
           selection.account.accountId,
@@ -2901,6 +3137,11 @@ async function streamAnthropicRequest(res, { sessionName, body, headers, url }) 
         reason: stopReason,
         mode: session.costMode,
       })
+      logger.info('request', 'stream completed', {
+        session: sessionName, accountId: account.accountId,
+        durationMs: endedAt - requestStartedAt, accountDurationMs,
+        inputTokens, outputTokens, stopReason, repairedCount,
+      })
       session.requestCount += 1
       session.turns += 1
       session.updatedAt = new Date().toISOString()
@@ -3032,6 +3273,15 @@ async function executeAnthropicRequest({ sessionName, body, headers, url }) {
         mode: session.costMode,
       })
 
+      logger.info('request', 'anthropic non-stream completed', {
+        session: sessionName, accountId: account.accountId,
+        durationMs: Date.now() - requestStartedAt, accountDurationMs,
+        inputTokens: anthropicMessage.usage.input_tokens,
+        outputTokens: anthropicMessage.usage.output_tokens,
+        stopReason: anthropicMessage.stop_reason,
+        repairedCount: repairResult.repairedCount,
+      })
+
       session.requestCount += 1
       session.turns += 1
       session.updatedAt = new Date().toISOString()
@@ -3136,6 +3386,14 @@ async function executeOpenAIRequest({ sessionName, body, headers }) {
         reason: response.data?.choices?.[0]?.finish_reason || 'stop',
         mode: session.costMode,
       })
+
+      logger.info('request', 'openai non-stream completed', {
+        session: sessionName, accountId: account.accountId,
+        durationMs: Date.now() - requestStartedAt, accountDurationMs,
+        inputTokens: usage.prompt_tokens || 0, outputTokens: usage.completion_tokens || 0,
+        finishReason: response.data?.choices?.[0]?.finish_reason,
+      })
+
       session.requestCount += 1
       session.turns += 1
       session.updatedAt = new Date().toISOString()
@@ -3459,6 +3717,7 @@ async function pollLoginSession(sessionName) {
   }
 
   const account = upsertStoredAccount(user, session)
+  logger.info('auth', 'login completed', { email: account.email, accountId: account.accountId })
   const completedSession = {
     ...session,
     authenticated: true,
@@ -3483,8 +3742,13 @@ async function pollLoginSession(sessionName) {
 }
 
 const server = createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host || CONFIG.host}`)
+  const requestStartedAt = Date.now()
+  const isApiRoute = url.pathname.startsWith('/v1/') || url.pathname === '/health'
+  if (isApiRoute) {
+    logger.debug('router', 'request', { method: req.method, path: url.pathname })
+  }
   try {
-    const url = new URL(req.url, `http://${req.headers.host || CONFIG.host}`)
 
     if (req.method === 'GET' && url.pathname === '/') {
       if (serveStaticFile(res, path.join(PUBLIC_DIR, 'index.html'))) {
@@ -3581,6 +3845,7 @@ const server = createServer(async (req, res) => {
       clearLoginSessionsForAccount(accountId)
       removeStoredAccount(accountId)
       removeAccountRuntimeStats(accountId)
+      logger.info('auth', 'account logged out', { accountId, email: account.email })
       sendJson(res, 200, {
         ok: true,
         loggedOut: true,
@@ -3595,6 +3860,7 @@ const server = createServer(async (req, res) => {
       loginSessions.clear()
       writeStoredAccounts([])
       accountRuntimeStats.clear()
+      logger.info('auth', 'all accounts logged out')
       sendJson(res, 200, { ok: true, loggedOutAll: true })
       return
     }
@@ -3602,8 +3868,12 @@ const server = createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/health') {
       const sessionName = resolveSessionName({}, req.headers, url)
       const auth = buildAuthPresentation(sessionName)
-      sendJson(res, 200, {
-        ok: true,
+      const backendCacheAge = Math.round((Date.now() - backendLiveness.checkedAt) / 1000)
+      const backendCacheFresh = backendLiveness.checkedAt > 0 && (Date.now() - backendLiveness.checkedAt) < HEALTH_CACHE_TTL
+      const status = computeHealthStatus({ backendOk: backendCacheFresh ? backendLiveness.ok : undefined, backendCacheFresh })
+      const base = {
+        ok: status !== 'unhealthy',
+        status,
         host: CONFIG.host,
         port: CONFIG.port,
         cwd: CONFIG.cwd,
@@ -3622,6 +3892,9 @@ const server = createServer(async (req, res) => {
           environmentAccountPresent: auth.environmentAccountPresent,
         },
         bridgeSessions: bridgeSessions.size,
+        backendCacheAge,
+        system: buildSystemMetrics(),
+        accountPool: buildAccountPoolHealth(),
         compatibility: {
           protocol: 'anthropic-messages',
           supportsNativeTools: true,
@@ -3629,7 +3902,36 @@ const server = createServer(async (req, res) => {
           supportsInstalledPluginTools: true,
         },
         ...inspectBridgeSession(sessionName),
-      })
+      }
+
+      if (url.searchParams.get('verbose') !== '1') {
+        sendJson(res, 200, base)
+        return
+      }
+
+      // verbose mode: probe backend + each account
+      const [backend, accounts] = await Promise.all([
+        probeBackendConnectivity(),
+        Promise.all(listAuthAccounts().map(async (acct) => {
+          const liveness = await probeAccountLiveness(acct)
+          const summary = buildAccountRuntimeSummary(acct.accountId)
+          return { accountId: acct.accountId, email: acct.email, source: acct.source, liveness, ...summary }
+        })),
+      ])
+      const verboseStatus = computeHealthStatus({ backendOk: backend.ok, backendCacheFresh: true })
+      base.ok = verboseStatus !== 'unhealthy'
+      base.status = verboseStatus
+      base.backend = {
+        reachable: backend.ok,
+        latencyMs: backend.latencyMs,
+        status: backend.status,
+        error: backend.error,
+        checkedAt: backend.checkedAt ? new Date(backend.checkedAt).toISOString() : null,
+        cacheAge: Math.round((Date.now() - backend.checkedAt) / 1000),
+      }
+      base.accounts = accounts
+      logger.debug('health', 'verbose check', { backendOk: backend.ok, status: verboseStatus, accountCount: accounts.length })
+      sendJson(res, 200, base)
       return
     }
 
@@ -3767,11 +4069,18 @@ const server = createServer(async (req, res) => {
     })
   } catch (error) {
     if (res.headersSent) {
+      logger.warn('router', 'response headers already sent on error', { method: req.method, path: url.pathname })
       try { res.end() } catch {}
       return
     }
     const statusCode =
       typeof error?.statusCode === 'number' ? error.statusCode : 500
+
+    logger.error('router', 'request error', {
+      method: req.method, path: url.pathname, statusCode,
+      error: error?.message, errorCode: error?.errorCode, errorType: error?.errorType,
+      durationMs: Date.now() - requestStartedAt,
+    })
 
     sendJson(res, statusCode, {
       error: {
@@ -3783,7 +4092,8 @@ const server = createServer(async (req, res) => {
 })
 
 server.listen(CONFIG.port, CONFIG.host, () => {
-  console.log(
-    `Freebuff bridge listening on http://${CONFIG.host}:${CONFIG.port} using cwd ${CONFIG.cwd}, model ${runtimeConfig.modelAlias}, mode ${runtimeConfig.costMode}, agent ${runtimeConfig.agentId}`,
-  )
+  logger.info('server', 'listening', {
+    host: CONFIG.host, port: CONFIG.port, cwd: CONFIG.cwd,
+    model: runtimeConfig.modelAlias, mode: runtimeConfig.costMode, agent: runtimeConfig.agentId,
+  })
 })

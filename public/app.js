@@ -74,6 +74,7 @@ const els = {
   configModeHelp: document.querySelector('#config-mode-help'),
   configAgentId: document.querySelector('#config-agent-id'),
   configBackendModel: document.querySelector('#config-backend-model'),
+  configAllowPaidFallback: document.querySelector('#config-allow-paid-fallback'),
   tutorialModelAlias: document.querySelector('#tutorial-model-alias'),
   tutorialModelCommand: document.querySelector('#tutorial-model-command'),
   tutorialSettingsJson: document.querySelector('#tutorial-settings-json'),
@@ -207,6 +208,72 @@ function accountStatusPill(label, tone = 'neutral') {
   return `<span class="account-status account-status-${tone}">${label}</span>`
 }
 
+function summarizeUnavailableModes(account, activeMode) {
+  const unavailableModes =
+    account?.unavailableModes && typeof account.unavailableModes === 'object'
+      ? account.unavailableModes
+      : {}
+
+  const current = unavailableModes[activeMode]
+  if (current?.reason) {
+    return {
+      label: '当前模式不可用',
+      tone: 'err',
+      detail: `${activeMode}: ${current.reason}`,
+    }
+  }
+
+  const firstEntry = Object.entries(unavailableModes).find(
+    ([, value]) => value?.reason,
+  )
+  if (firstEntry) {
+    return {
+      label: '部分模式受限',
+      tone: 'err',
+      detail: `${firstEntry[0]}: ${firstEntry[1].reason}`,
+    }
+  }
+
+  return null
+}
+
+function describeAccountStatus(account, activeMode) {
+  if (!account?.inPool) {
+    return {
+      label: '停用',
+      tone: 'err',
+      detail: account?.lastFailureReason || '',
+    }
+  }
+
+  if (account?.lastFailureLevel === 'blocking') {
+    return {
+      label: '不可用',
+      tone: 'err',
+      detail: account?.lastFailureReason || '该账号当前不可用。',
+    }
+  }
+
+  const unavailable = summarizeUnavailableModes(account, activeMode)
+  if (unavailable) {
+    return unavailable
+  }
+
+  if (account?.isCoolingDown) {
+    return {
+      label: `冷却 ${formatCooldown(account.cooldownUntil)}`,
+      tone: 'warn',
+      detail: account?.lastFailureReason || '最近请求失败，暂时降权。',
+    }
+  }
+
+  return {
+    label: '就绪',
+    tone: 'ok',
+    detail: '',
+  }
+}
+
 function populateModeDropdown(modes, selectedValue) {
   const options = Array.isArray(modes) && modes.length > 0 ? modes : fallbackModes
   els.configMode.innerHTML = options
@@ -230,6 +297,7 @@ function resolveModeDefinition(config) {
 function renderAccount(overview) {
   const auth = overview.auth
   const accounts = Array.isArray(overview.accounts) ? overview.accounts : []
+  const activeMode = overview?.config?.mode || overview?.config?.costMode || 'free'
   els.authPill.textContent = auth.authenticated
     ? `${auth.availableAccounts || 0} 个可用账号`
     : '未登录'
@@ -324,7 +392,9 @@ function renderAccount(overview) {
         <tbody>
           ${accounts
             .map(
-              (account) => `
+              (account) => {
+                const status = describeAccountStatus(account, activeMode)
+                return `
                 <tr>
                   <td>
                     <div class="account-cell-main">${formatAccountName(account)}</div>
@@ -333,13 +403,10 @@ function renderAccount(overview) {
                   <td>${account.source || '-'}</td>
                   <td>${account.avgTps ? `${account.avgTps} t/s` : '-'}</td>
                   <td>${account.avgDurationMs ? formatDuration(account.avgDurationMs) : '-'}</td>
-                  <td>${
-                    !account.inPool
-                      ? accountStatusPill('停用', 'warn')
-                      : account.isCoolingDown
-                        ? accountStatusPill(`冷却 ${formatCooldown(account.cooldownUntil)}`, 'warn')
-                        : accountStatusPill('就绪', 'ok')
-                  }</td>
+                  <td>
+                    ${accountStatusPill(status.label, status.tone)}
+                    ${status.detail ? `<div class="account-subline" style="margin-top: 6px; white-space: normal;">${status.detail}</div>` : ''}
+                  </td>
                   <td>${account.boundSessionCount || 0}</td>
                   <td class="account-action-cell">
                     ${
@@ -348,7 +415,8 @@ function renderAccount(overview) {
                         : `<button class="button button-danger button-sm" data-action="logout-account" data-account-id="${account.accountId}">登出</button>`
                     }
                   </td>
-                </tr>`,
+                </tr>`
+              },
             )
             .join('')}
         </tbody>
@@ -374,6 +442,7 @@ function renderConfig(overview) {
     config.backendModel || availableModels[0]?.value || ''
 
   populateModelDropdown(availableModels, selectedBackendModel)
+  els.configAllowPaidFallback.checked = config.allowPaidModeFallback === true
 
   const modelAlias = config.modelAlias || 'freebuff-bridge'
   els.tutorialModelAlias.textContent = modelAlias
@@ -679,6 +748,7 @@ els.configForm.addEventListener('submit', async (event) => {
           modelAlias: els.configModelAlias.value,
           mode: els.configMode.value,
           backendModel: els.configBackendModel.value,
+          allowPaidModeFallback: els.configAllowPaidFallback.checked,
         }),
       })
       await refreshOverview()

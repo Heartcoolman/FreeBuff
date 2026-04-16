@@ -70,6 +70,14 @@
               <span>后端模型</span>
               <select id="config-backend-model" name="backendModel"></select>
             </label>
+            <label class="field">
+              <span>失败回退</span>
+              <label style="display: flex; align-items: center; gap: 8px;">
+                <input id="config-allow-paid-fallback" name="allowPaidModeFallback" type="checkbox" />
+                <span>允许 `free` 失败时自动切换到付费模式</span>
+              </label>
+              <p class="muted" style="margin: 4px 0 0;">默认关闭。关闭时，`free` 不可用会直接报错，不会静默切到 `default`。</p>
+            </label>
             <div class="button-row">
               <button type="submit" class="button button-primary">保存运行配置</button>
             </div>

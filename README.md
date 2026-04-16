@@ -135,12 +135,13 @@ curl "http://127.0.0.1:8765/v1/freebuff/login/status?session=login"
 | `FREEBUFF_USAGE_HISTORY_LIMIT` | `500` | 内存中保留的用量条数 |
 | `FREEBUFF_LOGIN_BASE_URL` | `https://freebuff.com` | 登录基础 URL |
 | `FREEBUFF_API_BASE_URL` | `https://www.codebuff.com` | API 基础 URL |
+| `FREEBUFF_LOG_LEVEL` | `info` | 日志级别，支持 `debug/info/warn/error` |
 
 ## 接口列表
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/health` | 健康检查与认证状态 |
+| GET | `/health` | 健康检查与认证状态（`?verbose=1` 增加后端探活与账号预检） |
 | GET | `/` | 控制台页面 |
 | GET | `/v1/models` | 模型列表 |
 | POST | `/v1/messages` | Anthropic Messages 接口 |

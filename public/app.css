@@ -598,6 +598,11 @@ td {
   color: var(--success);
 }
 
+.account-status-err {
+  background: rgba(220, 38, 38, 0.1);
+  color: var(--danger);
+}
+
 .account-status-warn {
   background: rgba(245, 158, 11, 0.12);
   color: #b45309;
