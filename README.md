@@ -2,6 +2,51 @@
 
 本地 Anthropic/OpenAI 兼容桥接服务，将 Claude Code 及其他客户端的请求转发至 Freebuff/Codebuff 官方后端，免费使用 AI 编程能力。
 
+## 本次更新（2026-04）
+
+这次更新的目标是两件事：**让应用重新可用**，以及**把控制台整理成更稳定、可维护的后台界面**。
+
+### 后端修复
+
+- 补上新版 Freebuff `free` 模式所需的 session 握手流程：
+  - 接入 `POST /api/v1/freebuff/session`
+  - 接入 `GET /api/v1/freebuff/session`
+  - 接入 `DELETE /api/v1/freebuff/session`
+- 在请求上游 Codebuff 时注入 `freebuff_instance_id`，兼容当前官方 free-session gate。
+- 为 `free` 模式补齐可恢复错误处理：
+  - `freebuff_update_required (426)`
+  - `session_superseded (409)`
+  - `session_expired (410)`
+- 对 `waiting_room_required (428)` / `waiting_room_queued (429)` 保持透传，不做错误重试死循环。
+- Anthropic `/v1/messages` 的**流式**与**非流式**路径都已接入上述兼容逻辑。
+
+### 前端更新
+
+- 控制台重构为**多页布局**：`总览` / `使用统计`。
+- 使用统计页单独拆出，支持更清晰的汇总卡片与请求明细表。
+- 重新整理账号管理区、运行配置区、会话管理区和 Claude Code 接入说明。
+- 修复账号池表格横向溢出、文字发飘、标题区说明过重等问题。
+- 移除旧的“实验桥”入口，界面信息结构更简洁。
+
+### 当前状态
+
+当前版本已恢复正常使用，重点验证如下：
+
+- `npm start` 可正常启动本地服务
+- `GET /health` 正常返回
+- `free` 模式不再因为缺少新版 session 握手而直接触发 `freebuff_update_required (426)`
+- `POST /v1/messages` 与流式 SSE 路径都已接入同一套 free-session 兼容逻辑
+- 如果官方 free session 进入 waiting room，桥会正确返回 `waiting_room_required` / `waiting_room_queued`，而不是陷入旧版兼容错误
+- 控制台页面可正常打开，`总览` / `使用统计` 可正常切换
+
+如果你之前遇到：
+
+```json
+{"error":{"message":"This version of freebuff is out of date...","code":"freebuff_update_required"}}
+```
+
+这次更新就是为了解决这条错误对应的兼容问题。
+
 ## 工作原理
 
 ```
