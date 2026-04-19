@@ -3,197 +3,212 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Codebuff 桥接控制台</title>
+    <title>FreeBuff Bridge 控制台</title>
     <link rel="stylesheet" href="/app.css" />
   </head>
   <body>
-    <div class="background-grid"></div>
+    <nav class="top-nav">
+      <div class="top-nav-inner">
+        <a class="top-nav-brand" href="#overview">FreeBuff</a>
+        <div class="top-nav-links">
+          <a class="top-nav-link active" href="#overview" data-page="overview">总览</a>
+          <a class="top-nav-link" href="#usage" data-page="usage">使用统计</a>
+          <div class="top-nav-spacer"></div>
+          <div id="connection-status" class="connection-status">检查中</div>
+          <div id="current-time" class="hero-time">--:--</div>
+        </div>
+      </div>
+    </nav>
+
     <main class="shell">
-      <header class="hero">
-        <div>
-          <p class="eyebrow">本地管理面板</p>
-          <h1>Codebuff 桥接控制台</h1>
-          <p class="hero-copy">
-            统一管理账号状态、运行模型配置、会话状态和 Token 使用记录。
-          </p>
-        </div>
-        <div class="hero-actions">
-          <button id="refresh-all" class="button button-primary">刷新面板</button>
-          <div class="auto-refresh-wrap">
-            <span>自动刷新</span>
-            <select id="auto-refresh-select">
-              <option value="0">关闭</option>
-              <option value="15">15 秒</option>
-              <option value="30">30 秒</option>
-              <option value="60">60 秒</option>
-            </select>
-          </div>
-          <a class="button button-ghost" href="/health" target="_blank" rel="noreferrer">健康检查</a>
-        </div>
-      </header>
-
-      <section class="grid two-up">
-        <article class="panel panel-accent">
-          <div class="panel-head">
-            <div>
-              <p class="label">账号</p>
-              <h2>账号池与登录</h2>
-            </div>
-            <span id="auth-pill" class="pill">检查中</span>
-          </div>
-          <div id="auth-summary" class="stack compact"></div>
-          <div id="login-actions"></div>
-          <div id="login-url-box" style="margin-top: 14px;"></div>
-          <div id="accounts-list" class="stack compact" style="margin-top: 14px;"></div>
-        </article>
-
-        <article class="panel">
-          <div class="panel-head">
-            <div>
-              <p class="label">运行时</p>
-              <h2>模型与模式</h2>
-            </div>
-            <span class="pill pill-soft">保存后会清空现有会话</span>
-          </div>
-          <form id="config-form" class="stack">
-            <label class="field">
-              <span>Claude 侧模型别名</span>
-              <input id="config-model-alias" name="modelAlias" type="text" />
-            </label>
-            <label class="field">
-              <span>Codebuff 模式</span>
-              <select id="config-mode" name="mode"></select>
-              <p id="config-mode-help" class="muted" style="margin: 4px 0 0;"></p>
-              <p class="muted" style="margin: 0;">派生 Agent：<code id="config-agent-id"></code></p>
-            </label>
-            <label class="field">
-              <span>后端模型</span>
-              <select id="config-backend-model" name="backendModel"></select>
-            </label>
-            <label class="field">
-              <span>失败回退</span>
-              <label style="display: flex; align-items: center; gap: 8px;">
-                <input id="config-allow-paid-fallback" name="allowPaidModeFallback" type="checkbox" />
-                <span>允许 `free` 失败时自动切换到付费模式</span>
-              </label>
-              <p class="muted" style="margin: 4px 0 0;">默认关闭。关闭时，`free` 不可用会直接报错，不会静默切到 `default`。</p>
-            </label>
-            <div class="button-row">
-              <button type="submit" class="button button-primary">保存运行配置</button>
-            </div>
-          </form>
-        </article>
-      </section>
-
-      <section class="grid metrics" id="summary-cards"></section>
-
-      <section class="grid two-up">
-        <article class="panel">
-          <div class="panel-head">
-            <div>
-              <p class="label">兼容状态</p>
-              <h2>Claude Code 工具协议</h2>
+      <!-- Page: Overview -->
+      <div id="page-overview" class="page active">
+        <header class="hero">
+          <div class="hero-content">
+            <p class="eyebrow">本地桥接管理面板</p>
+            <h1>FreeBuff Bridge</h1>
+            <p class="hero-copy">统一管理账号状态、运行模型配置、会话状态和 Token 使用记录。</p>
+            <div class="hero-actions">
+              <button id="refresh-all" class="button button-primary">刷新面板</button>
+              <div class="auto-refresh-wrap">
+                <span>自动刷新</span>
+                <select id="auto-refresh-select">
+                  <option value="0">关闭</option>
+                  <option value="15">15 秒</option>
+                  <option value="30">30 秒</option>
+                  <option value="60">60 秒</option>
+                </select>
+              </div>
+              <a class="button button-ghost" href="/health" target="_blank" rel="noreferrer">健康检查</a>
             </div>
           </div>
-          <div id="compatibility-card" class="stack compact"></div>
-        </article>
+        </header>
 
-        <article class="panel">
-          <div class="panel-head">
-            <div>
-              <p class="label">会话</p>
-              <h2>当前桥接会话</h2>
-            </div>
+        <section class="section">
+          <div class="grid-two">
+            <article class="card card-accent">
+              <div class="card-header">
+                <div>
+                  <div class="section-title">账号管理</div>
+                  <div class="card-title">账号池与登录</div>
+                </div>
+                <span id="auth-pill" class="badge badge-muted">检查中</span>
+              </div>
+              <div class="card-body">
+                <div id="auth-summary" class="stack-sm"></div>
+                <div id="login-actions" class="button-row" style="margin-top: var(--spacing-md);"></div>
+                <div id="login-url-box" style="margin-top: var(--spacing-md);"></div>
+                <div id="accounts-list" style="margin-top: var(--spacing-md);"></div>
+              </div>
+            </article>
+
+            <article class="card">
+              <div class="card-header">
+                <div>
+                  <div class="section-title">运行时配置</div>
+                  <div class="card-title">模型与模式</div>
+                </div>
+                <span class="badge badge-warning">保存后会清空现有会话</span>
+              </div>
+              <div class="card-body">
+                <div class="config-pills" id="config-pills">
+                  <div class="config-pill">
+                    <span class="config-pill-label">模式</span>
+                    <span class="config-pill-value" id="pill-mode">-</span>
+                  </div>
+                  <div class="config-pill">
+                    <span class="config-pill-label">模型</span>
+                    <span class="config-pill-value" id="pill-model">-</span>
+                  </div>
+                  <div class="config-pill">
+                    <span class="config-pill-label">Agent</span>
+                    <span class="config-pill-value font-mono" id="pill-agent">-</span>
+                  </div>
+                </div>
+
+                <form id="config-form" class="form-stack">
+                  <label class="field">
+                    <span class="field-label">Claude 侧模型别名</span>
+                    <input id="config-model-alias" name="modelAlias" type="text" />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">Codebuff 模式</span>
+                    <select id="config-mode" name="mode"></select>
+                    <p id="config-mode-help" class="help-text"></p>
+                  </label>
+                  <label class="field">
+                    <span class="field-label">后端模型</span>
+                    <select id="config-backend-model" name="backendModel"></select>
+                  </label>
+                  <label class="field">
+                    <span class="field-label">失败回退</span>
+                    <div class="checkbox-field">
+                      <input id="config-allow-paid-fallback" name="allowPaidModeFallback" type="checkbox" />
+                      <span class="checkbox-label">允许 `free` 失败时自动切换到付费模式</span>
+                    </div>
+                    <p class="help-text">默认关闭。关闭时，`free` 不可用会直接报错，不会静默切到 `default`。</p>
+                  </label>
+                  <div class="button-row">
+                    <button type="submit" class="button button-primary">保存运行配置</button>
+                  </div>
+                </form>
+              </div>
+            </article>
           </div>
-          <div id="sessions-list" class="stack compact"></div>
-        </article>
-      </section>
+        </section>
 
-      <section class="grid">
-        <article class="panel">
-          <div class="panel-head">
-            <div>
-              <p class="label">使用记录</p>
-              <h2>Token 统计</h2>
+        <section class="section">
+          <div class="grid-two">
+            <article class="card">
+              <div class="card-header">
+                <div>
+                  <div class="section-title">兼容状态</div>
+                  <div class="card-title">Claude Code 工具协议</div>
+                </div>
+              </div>
+              <div class="card-body">
+                <div id="compatibility-card" class="stack-sm"></div>
+              </div>
+            </article>
+
+            <article class="card">
+              <div class="card-header">
+                <div>
+                  <div class="section-title">会话管理</div>
+                  <div class="card-title">当前桥接会话</div>
+                </div>
+              </div>
+              <div class="card-body">
+                <div id="sessions-list" class="session-list"></div>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section class="section">
+          <article class="card card-accent">
+            <div class="card-header">
+              <div>
+                <div class="section-title">快速入门</div>
+                <div class="card-title">如何接入 Claude Code</div>
+              </div>
+              <span class="badge badge-muted">按顺序操作</span>
             </div>
-            <div class="button-row">
-              <button id="refresh-usage" class="button button-ghost">刷新</button>
+            <div class="card-body">
+              <div class="tutorial-grid">
+                <div class="callout callout-accent"><p class="callout-title">1. 启动桥接服务</p><pre class="code-block"><code>cd /Users/liji/FreeBuff
+npm start</code></pre><p class="muted text-sm">保持这个进程运行，默认监听 `http://127.0.0.1:8765`。</p></div>
+                <div class="callout callout-accent"><p class="callout-title">2. 给 Claude Code 配环境变量</p><pre class="code-block"><code>export ANTHROPIC_BASE_URL=http://127.0.0.1:8765
+export ANTHROPIC_API_KEY=dummy</code></pre><p class="muted text-sm">`ANTHROPIC_API_KEY` 这里只是占位，真正鉴权走本地 Codebuff 凭据。</p></div>
+                <div class="callout callout-accent"><p class="callout-title">3. 在 Claude Code 里使用这个模型</p><pre class="code-block"><code id="tutorial-model-command">claude --model freebuff-bridge</code></pre><p class="muted text-sm">当前推荐模型别名：<strong id="tutorial-model-alias">freebuff-bridge</strong></p></div>
+                <div class="callout callout-accent"><p class="callout-title">4. 持久化到 Claude Code 配置</p><pre class="code-block"><code id="tutorial-settings-json"></code></pre><p class="muted text-sm">可写到 `~/.claude/settings.json` 或你自己的项目级 Claude Code 配置里。</p></div>
+                <div class="callout callout-accent"><p class="callout-title">5. 第一次使用前先确认登录</p><p class="muted text-sm">如果上面的账号区域还没有可用账号，先点"新增登录账号"，浏览器完成 Codebuff 官方登录后，再点"检查登录状态"。</p></div>
+                <div class="callout callout-accent"><p class="callout-title">6. 验证是否接通</p><pre class="code-block"><code>curl http://127.0.0.1:8765/health</code></pre><p class="muted text-sm">只要 `authenticated: true`，Claude Code 就可以通过这个桥使用 Codebuff 侧能力。</p></div>
+              </div>
+            </div>
+          </article>
+        </section>
+      </div>
+
+      <!-- Page: Usage Statistics -->
+      <div id="page-usage" class="page">
+        <section class="section usage-section">
+          <div class="usage-section-header">
+            <div>
+              <h2 class="usage-section-title">使用统计</h2>
+            </div>
+            <div class="usage-section-actions">
+              <button id="refresh-usage" class="button button-secondary">刷新</button>
               <button id="reset-usage" class="button button-danger">清空历史</button>
+              <span id="usage-updated-at" class="usage-updated-at">更新于：--:--</span>
             </div>
           </div>
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>时间</th>
-                  <th>账号</th>
-                  <th>会话</th>
-                  <th>类型</th>
-                  <th>模型</th>
-                  <th>输入</th>
-                  <th>输出</th>
-                  <th>总计</th>
-                  <th>工具数</th>
-                  <th>停止原因</th>
-                  <th>延迟</th>
-                  <th>Token/秒</th>
-                </tr>
-              </thead>
-              <tbody id="usage-table"></tbody>
-            </table>
-          </div>
-        </article>
-      </section>
 
-      <section class="grid">
-        <article class="panel panel-accent">
-          <div class="panel-head">
-            <div>
-              <p class="label">教程</p>
-              <h2>如何接入 Claude Code</h2>
-            </div>
-            <span class="pill pill-soft">按顺序操作</span>
-          </div>
-          <div class="tutorial-grid">
-            <div class="callout">
-              <p class="callout-title">1. 启动桥接服务</p>
-              <pre class="code-block"><code>cd /Users/liji/FreeBuff
-npm start</code></pre>
-              <p class="muted">保持这个进程运行，默认监听 `http://127.0.0.1:8765`。</p>
-            </div>
+          <div id="summary-cards" class="usage-stats-grid"></div>
 
-            <div class="callout">
-              <p class="callout-title">2. 给 Claude Code 配环境变量</p>
-              <pre class="code-block"><code>export ANTHROPIC_BASE_URL=http://127.0.0.1:8765
-export ANTHROPIC_API_KEY=dummy</code></pre>
-              <p class="muted">`ANTHROPIC_API_KEY` 这里只是占位，真正鉴权走本地 Codebuff 凭据。</p>
+          <article class="card usage-records-card">
+            <div class="card-header">
+              <div>
+                <div class="section-title">明细记录</div>
+                <div class="card-title">请求明细</div>
+              </div>
             </div>
-
-            <div class="callout">
-              <p class="callout-title">3. 在 Claude Code 里使用这个模型</p>
-              <pre class="code-block"><code id="tutorial-model-command">claude --model freebuff-bridge</code></pre>
-              <p class="muted">当前推荐模型别名：<strong id="tutorial-model-alias">freebuff-bridge</strong></p>
+            <div class="card-body" style="padding: 0;">
+              <div class="table-container">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>时间</th><th>账号</th><th>会话</th><th>类型</th><th>模型</th>
+                      <th>输入</th><th>输出</th><th>总计</th><th>工具数</th><th>停止原因</th><th>延迟</th><th>Token/秒</th>
+                    </tr>
+                  </thead>
+                  <tbody id="usage-table"></tbody>
+                </table>
+              </div>
             </div>
-
-            <div class="callout">
-              <p class="callout-title">4. 持久化到 Claude Code 配置</p>
-              <pre class="code-block"><code id="tutorial-settings-json"></code></pre>
-              <p class="muted">可写到 `~/.claude/settings.json` 或你自己的项目级 Claude Code 配置里。</p>
-            </div>
-
-            <div class="callout">
-              <p class="callout-title">5. 第一次使用前先确认登录</p>
-              <p class="muted">如果上面的账号区域还没有可用账号，先点"新增登录账号"，浏览器完成 Codebuff 官方登录后，再点"检查登录状态"。</p>
-            </div>
-
-            <div class="callout">
-              <p class="callout-title">6. 验证是否接通</p>
-              <pre class="code-block"><code>curl http://127.0.0.1:8765/health</code></pre>
-              <p class="muted">只要 `authenticated: true`，Claude Code 就可以通过这个桥使用 Codebuff 侧能力。</p>
-            </div>
-          </div>
-        </article>
-      </section>
+          </article>
+        </section>
+      </div>
 
       <p id="toast" class="toast" aria-live="polite"></p>
     </main>

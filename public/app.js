@@ -72,13 +72,18 @@ const els = {
   configModelAlias: document.querySelector('#config-model-alias'),
   configMode: document.querySelector('#config-mode'),
   configModeHelp: document.querySelector('#config-mode-help'),
-  configAgentId: document.querySelector('#config-agent-id'),
   configBackendModel: document.querySelector('#config-backend-model'),
   configAllowPaidFallback: document.querySelector('#config-allow-paid-fallback'),
   tutorialModelAlias: document.querySelector('#tutorial-model-alias'),
   tutorialModelCommand: document.querySelector('#tutorial-model-command'),
   tutorialSettingsJson: document.querySelector('#tutorial-settings-json'),
   autoRefreshSelect: document.querySelector('#auto-refresh-select'),
+  connectionStatus: document.querySelector('#connection-status'),
+  currentTime: document.querySelector('#current-time'),
+  pillMode: document.querySelector('#pill-mode'),
+  pillModel: document.querySelector('#pill-model'),
+  pillAgent: document.querySelector('#pill-agent'),
+  usageUpdatedAt: document.querySelector('#usage-updated-at'),
 }
 
 const autoRefresh = { intervalId: null }
@@ -205,7 +210,8 @@ function formatAccountName(account) {
 }
 
 function accountStatusPill(label, tone = 'neutral') {
-  return `<span class="account-status account-status-${tone}">${label}</span>`
+  const toneClass = tone === 'ok' ? 'badge-success' : tone === 'err' ? 'badge-error' : tone === 'warn' ? 'badge-warning' : 'badge-muted'
+  return `<span class="badge ${toneClass}">${label}</span>`
 }
 
 function summarizeUnavailableModes(account, activeMode) {
@@ -298,16 +304,31 @@ function renderAccount(overview) {
   const auth = overview.auth
   const accounts = Array.isArray(overview.accounts) ? overview.accounts : []
   const activeMode = overview?.config?.mode || overview?.config?.costMode || 'free'
+
   els.authPill.textContent = auth.authenticated
     ? `${auth.availableAccounts || 0} 个可用账号`
     : '未登录'
-  els.authPill.classList.toggle('pill-ok', !!auth.authenticated)
-  els.authPill.classList.toggle('pill-err', !auth.authenticated)
+  els.authPill.className = `badge ${auth.authenticated ? 'badge-success' : 'badge-error'}`
+
+  if (els.connectionStatus) {
+    els.connectionStatus.textContent = auth.authenticated ? '已连接' : '未连接'
+    els.connectionStatus.className = `connection-status ${auth.authenticated ? 'connected' : 'disconnected'}`
+  }
+
   els.authSummary.innerHTML = `
-    <div class="summary-strip">
-      <div class="stat-chip"><span>可用账号</span><strong>${auth.availableAccounts || 0}</strong></div>
-      <div class="stat-chip"><span>总账号数</span><strong>${auth.totalAccounts || 0}</strong></div>
-      <div class="stat-chip"><span>环境账号</span><strong>${auth.environmentAccountPresent ? '有' : '无'}</strong></div>
+    <div class="config-pills">
+      <div class="config-pill">
+        <span class="config-pill-label">可用账号</span>
+        <span class="config-pill-value">${auth.availableAccounts || 0}</span>
+      </div>
+      <div class="config-pill">
+        <span class="config-pill-label">总账号数</span>
+        <span class="config-pill-value">${auth.totalAccounts || 0}</span>
+      </div>
+      <div class="config-pill">
+        <span class="config-pill-label">环境账号</span>
+        <span class="config-pill-value">${auth.environmentAccountPresent ? '有' : '无'}</span>
+      </div>
     </div>`
 
   const s = state.loginSession
@@ -315,52 +336,44 @@ function renderAccount(overview) {
 
   if (s?.authenticated) {
     els.loginUrlBox.innerHTML = `
-      <div class="callout">
+      <div class="callout callout-success">
         <p class="callout-title">账号已加入池</p>
-        <p class="muted" style="margin: 4px 0 0;">${s.email || s.accountId || '新账号'} 已保存到本地，可参与新会话轮训。</p>
+        <p class="muted text-sm" style="margin-top: 4px;">${s.email || s.accountId || '新账号'} 已保存到本地，可参与新会话轮训。</p>
       </div>`
     els.loginActions.innerHTML = `
-      <div class="button-row">
-        <button class="button button-primary" data-action="start-login">新增登录账号</button>
-      </div>`
+      <button class="button button-primary" data-action="start-login">新增登录账号</button>`
   } else if (loginUrl && s?.expired) {
     els.loginUrlBox.innerHTML = `
-      <div class="callout callout-err">
+      <div class="callout callout-error">
         <p class="callout-title">登录链接已过期</p>
-        <p class="muted" style="margin: 4px 0 0;">请重新生成登录链接后在浏览器中完成验证。</p>
+        <p class="muted text-sm" style="margin-top: 4px;">请重新生成登录链接后在浏览器中完成验证。</p>
       </div>`
     els.loginActions.innerHTML = `
-      <div class="button-row">
-        <button class="button button-primary" data-action="start-login">重新生成登录链接</button>
-      </div>`
+      <button class="button button-primary" data-action="start-login">重新生成登录链接</button>`
   } else if (loginUrl) {
     const polling = !!autoPoll.timerId
     els.loginUrlBox.innerHTML = `
-      <div class="callout">
+      <div class="callout callout-accent">
         <p class="callout-title">登录链接${polling ? '<span class="poll-dot"></span>' : ''}</p>
-        <div class="url-row">
+        <div class="url-row" style="margin-top: 8px;">
           <a href="${loginUrl}" target="_blank" rel="noreferrer">${loginUrl}</a>
           <button class="button button-ghost button-sm" data-action="copy-url" data-url="${loginUrl}">复制</button>
         </div>
-        <p class="login-status login-status-waiting" style="margin: 6px 0 0;">
+        <p class="login-status login-status-waiting" style="margin-top: 8px;">
           ${polling ? '自动检测中，请在浏览器完成登录…' : s?.note || '登录流程已启动，请在浏览器中完成登录。'}
         </p>
       </div>`
     els.loginActions.innerHTML = `
-      <div class="button-row">
-        <button class="button button-primary" data-action="open-url" data-url="${loginUrl}">在浏览器中打开</button>
-        <button class="button button-ghost" data-action="check-login">手动检查状态</button>
-        <button class="button button-ghost" data-action="start-login">重新生成</button>
-      </div>`
+      <button class="button button-primary" data-action="open-url" data-url="${loginUrl}">在浏览器中打开</button>
+      <button class="button button-secondary" data-action="check-login">手动检查状态</button>
+      <button class="button button-ghost" data-action="start-login">重新生成</button>`
   } else {
     els.loginUrlBox.innerHTML = `
       <div class="callout">
-        <p class="muted" style="margin: 0;">点击新增登录账号后会生成官方 Codebuff 登录地址，可连续加入多个账号。</p>
+        <p class="muted text-sm">点击新增登录账号后会生成官方 Codebuff 登录地址，可连续加入多个账号。</p>
       </div>`
     els.loginActions.innerHTML = `
-      <div class="button-row">
-        <button class="button button-primary" data-action="start-login">新增登录账号</button>
-      </div>`
+      <button class="button button-primary" data-action="start-login">新增登录账号</button>`
   }
 
   els.accountsList.innerHTML = ''
@@ -370,22 +383,25 @@ function renderAccount(overview) {
   }
 
   els.accountsList.innerHTML = `
-    <div class="account-pool-head">
-      <div>
-        <p class="label">账号池</p>
-        <p class="muted" style="margin: 0;">每次请求都会按最近性能重选账号，优先最近 TPS 更高的账号。</p>
+    <div class="account-pool-header">
+      <div class="account-pool-title-row">
+        <div class="account-pool-title-group">
+          <h3 class="account-pool-title">账号池</h3>
+          <span class="account-pool-meta">按近期性能自动选择 · 优先高 TPS 账号</span>
+        </div>
+        <span class="badge badge-muted">${accounts.length} 个账号</span>
       </div>
     </div>
-    <div class="table-wrap account-table-wrap">
-      <table class="account-table">
+    <div class="table-container">
+      <table>
         <thead>
           <tr>
             <th>账号</th>
             <th>来源</th>
-            <th>最近 TPS</th>
-            <th>平均延迟</th>
+            <th>TPS</th>
+            <th>延迟</th>
             <th>状态</th>
-            <th>最近会话</th>
+            <th>会话</th>
             <th>操作</th>
           </tr>
         </thead>
@@ -401,8 +417,8 @@ function renderAccount(overview) {
                     <div class="account-subline">${account.accountId}</div>
                   </td>
                   <td>${account.source || '-'}</td>
-                  <td>${account.avgTps ? `${account.avgTps} t/s` : '-'}</td>
-                  <td>${account.avgDurationMs ? formatDuration(account.avgDurationMs) : '-'}</td>
+                  <td>${account.avgTps ? `<span class="numeric-cell">${account.avgTps} t/s</span>` : '-'}</td>
+                  <td>${account.avgDurationMs ? `<span class="numeric-cell">${formatDuration(account.avgDurationMs)}</span>` : '-'}</td>
                   <td>
                     ${accountStatusPill(status.label, status.tone)}
                     ${status.detail ? `<div class="account-subline" style="margin-top: 6px; white-space: normal;">${status.detail}</div>` : ''}
@@ -411,7 +427,7 @@ function renderAccount(overview) {
                   <td class="account-action-cell">
                     ${
                       account.readOnly
-                        ? '<span class="pill pill-soft">只读</span>'
+                        ? '<span class="badge badge-muted">只读</span>'
                         : `<button class="button button-danger button-sm" data-action="logout-account" data-account-id="${account.accountId}">登出</button>`
                     }
                   </td>
@@ -432,7 +448,16 @@ function renderConfig(overview) {
   populateModeDropdown(config.availableModes, mode)
   els.configModeHelp.textContent =
     modeDefinition?.description || '选择 Codebuff 模式；保存后会重建现有会话。'
-  els.configAgentId.textContent = config.agentId || modeDefinition?.agentId || '-'
+
+  if (els.pillMode) {
+    els.pillMode.textContent = modeDefinition?.label || mode || '-'
+  }
+  if (els.pillModel) {
+    els.pillModel.textContent = config.backendModel || '-'
+  }
+  if (els.pillAgent) {
+    els.pillAgent.textContent = config.agentId || modeDefinition?.agentId || '-'
+  }
 
   const availableModels = Array.isArray(config.availableBackendModels)
     ? config.availableBackendModels
@@ -456,22 +481,93 @@ function renderConfig(overview) {
 }`
 }
 
-function metricCard(label, value, detail) {
-  const article = document.createElement('article')
-  article.className = 'metric'
-  article.innerHTML = `<span>${label}</span><strong>${value}</strong><div class="muted">${detail}</div>`
-  return article
+function formatNumber(value, digits = 0) {
+  const num = Number(value || 0)
+  if (!Number.isFinite(num)) return digits > 0 ? '0.00' : '0'
+  return num.toLocaleString('zh-CN', {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  })
 }
 
-function renderSummary(summary) {
+function computeUsageStats(summary, records) {
+  const list = Array.isArray(records) ? records : []
+  const successCount = list.filter((record) => !record.errorSummary && !record.error).length
+  const failureCount = Math.max(list.length - successCount, 0)
+  const oneHourAgo = Date.now() - 60 * 60 * 1000
+  const recent = list.filter((record) => {
+    const time = new Date(record.createdAt).getTime()
+    return Number.isFinite(time) && time >= oneHourAgo
+  })
+  const recentRequests = recent.length
+  const recentTokens = recent.reduce((sum, record) => sum + Number(record.totalTokens || 0), 0)
+
+  return {
+    totalRequests: Number(summary?.requests || 0),
+    totalTokens: Number(summary?.totalTokens || 0),
+    promptTokens: Number(summary?.promptTokens || 0),
+    outputTokens: Number(summary?.outputTokens || 0),
+    successCount,
+    failureCount,
+    rpm: recentRequests,
+    tpm: recentTokens,
+  }
+}
+
+function createStatCard({ title, value, meta, tone = 'neutral' }) {
+  const card = document.createElement('div')
+  card.className = `usage-stat-card usage-stat-card-${tone}`
+  card.innerHTML = `
+    <div class="usage-stat-card-title">${title}</div>
+    <div class="usage-stat-card-value">${value}</div>
+    ${meta ? `<div class="usage-stat-card-meta">${meta}</div>` : ''}
+  `
+  return card
+}
+
+function renderSummary(summary, records = []) {
+  const stats = computeUsageStats(summary, records)
   els.summaryCards.innerHTML = ''
+
   els.summaryCards.append(
-    metricCard('请求次数', summary.requests, '已记录的桥接请求'),
-    metricCard('输入 Tokens', summary.promptTokens, '估算的输入 token 数'),
-    metricCard('输出 Tokens', summary.outputTokens, '估算的输出 token 数'),
-    metricCard('总 Tokens', summary.totalTokens, '输入 + 输出'),
-    metricCard('平均延迟', formatDuration(summary.avgDurationMs), '首字 token 平均耗时'),
-    metricCard('平均速度', summary.avgTps ? `${summary.avgTps} t/s` : '-', '输出 token/秒'),
+    createStatCard({
+      title: '总请求数',
+      value: formatNumber(stats.totalRequests),
+      meta: `成功: ${formatNumber(stats.successCount)} · 失败: ${formatNumber(stats.failureCount)}`,
+      tone: 'primary',
+    })
+  )
+  els.summaryCards.append(
+    createStatCard({
+      title: '总Token数',
+      value: formatNumber(stats.totalTokens, 2),
+      meta: `输入 / 输出 Tokens 统计`,
+      tone: 'success',
+    })
+  )
+  els.summaryCards.append(
+    createStatCard({
+      title: 'RPM (每分钟请求)',
+      value: formatNumber(stats.rpm, 2),
+      meta: `最近1分钟请求速率`,
+      tone: 'warning',
+    })
+  )
+  els.summaryCards.append(
+    createStatCard({
+      title: 'TPM (每分钟Token)',
+      value: formatNumber(stats.tpm, 2),
+      meta: `最近1分钟Token速率`,
+      tone: 'error',
+    })
+  )
+  els.summaryCards.append(
+    createStatCard({
+      title: '总花费',
+      value: '--',
+      meta: `费用统计功能开发中`,
+      tone: 'primary',
+    })
   )
 }
 
@@ -481,23 +577,37 @@ function renderCompatibility(overview) {
   const sourceSummary = compatibility.toolSourceSummary || {}
 
   els.compatibilityCard.innerHTML = `
-    <div class="meta-list">
-      <div><dt>协议</dt><dd>${compatibility.protocol || '-'}</dd></div>
-      <div><dt>原生工具</dt><dd>${compatibility.supportsNativeTools ? '支持' : '不支持'}</dd></div>
-      <div><dt>MCP 工具</dt><dd>${compatibility.supportsMcpTools ? '支持' : '不支持'}</dd></div>
-      <div><dt>插件工具</dt><dd>${compatibility.supportsInstalledPluginTools ? '支持' : '不支持'}</dd></div>
+    <div class="config-pills" style="margin-bottom: var(--spacing-md);">
+      <div class="config-pill">
+        <span class="config-pill-label">协议</span>
+        <span class="config-pill-value">${compatibility.protocol || '-'}</span>
+      </div>
+      <div class="config-pill">
+        <span class="config-pill-label">原生工具</span>
+        <span class="config-pill-value">${compatibility.supportsNativeTools ? '✓ 支持' : '✗ 不支持'}</span>
+      </div>
+      <div class="config-pill">
+        <span class="config-pill-label">MCP 工具</span>
+        <span class="config-pill-value">${compatibility.supportsMcpTools ? '✓ 支持' : '✗ 不支持'}</span>
+      </div>
+      <div class="config-pill">
+        <span class="config-pill-label">插件工具</span>
+        <span class="config-pill-value">${compatibility.supportsInstalledPluginTools ? '✓ 支持' : '✗ 不支持'}</span>
+      </div>
     </div>
-    <div class="muted">工具来源统计：builtin ${sourceSummary.builtin || 0} / mcp ${sourceSummary.mcp || 0} / plugin ${sourceSummary.plugin || 0}</div>
-    <div class="stack compact">
+    <p class="muted text-sm" style="margin-bottom: var(--spacing-md);">
+      工具来源统计：builtin ${sourceSummary.builtin || 0} / mcp ${sourceSummary.mcp || 0} / plugin ${sourceSummary.plugin || 0}
+    </p>
+    <div class="stack-sm">
       ${
         recentErrors.length === 0
-          ? '<div class="empty">最近没有协议或工具错误。</div>'
+          ? '<div class="empty" style="padding: var(--spacing-md);">最近没有协议或工具错误。</div>'
           : recentErrors
               .map(
-                (item) => `<div class="session-card">
-                  <div><strong>${item.session}</strong></div>
-                  <div class="muted">${formatDate(item.createdAt)}</div>
-                  <div class="muted">${item.errorSummary}</div>
+                (item) => `<div class="callout">
+                  <div style="font-weight: 600; margin-bottom: 4px;">${item.session}</div>
+                  <div class="muted text-sm">${formatDate(item.createdAt)}</div>
+                  <div class="muted text-sm" style="margin-top: 4px;">${item.errorSummary}</div>
                 </div>`,
               )
               .join('')
@@ -519,24 +629,41 @@ function renderSessions(overview) {
     const card = document.createElement('div')
     card.className = 'session-card'
     card.innerHTML = `
-      <div class="panel-head">
+      <div class="session-header">
         <div>
-          <p class="label">会话</p>
-          <h2>${session.session}</h2>
+          <div class="section-title">会话</div>
+          <div class="session-title">${session.session}</div>
         </div>
-        <button class="button button-ghost" data-reset-session="${session.session}">重置</button>
+        <button class="button button-ghost button-sm" data-reset-session="${session.session}">重置</button>
       </div>
-      <div class="meta-list">
-      <div><dt>轮次</dt><dd>${session.turns}</dd></div>
-      <div><dt>请求数</dt><dd>${session.usage.requests}</dd></div>
-      <div><dt>总 Tokens</dt><dd>${session.usage.totalTokens}</dd></div>
-      <div><dt>最近账号</dt><dd>${session.accountEmail || session.accountId || '-'}</dd></div>
-      <div><dt>模式</dt><dd>${session.costMode || 'free'}</dd></div>
+      <div class="session-meta">
+        <div class="meta-item">
+          <span class="meta-label">轮次</span>
+          <span class="meta-value">${session.turns}</span>
+        </div>
+        <div class="meta-item">
+          <span class="meta-label">请求数</span>
+          <span class="meta-value">${session.usage.requests}</span>
+        </div>
+        <div class="meta-item">
+          <span class="meta-label">总 Tokens</span>
+          <span class="meta-value">${session.usage.totalTokens}</span>
+        </div>
+        <div class="meta-item">
+          <span class="meta-label">最近账号</span>
+          <span class="meta-value">${session.accountEmail || session.accountId || '-'}</span>
+        </div>
+        <div class="meta-item">
+          <span class="meta-label">模式</span>
+          <span class="meta-value">${session.costMode || 'free'}</span>
+        </div>
       </div>
-      <div class="muted">最近切换: ${formatDate(session.lastAccountSwitchAt)}</div>
-      <div class="muted">切换原因: ${session.lastAccountSwitchReason || '-'}</div>
-      <div class="muted">client_id: ${session.codebuffMetadata?.client_id || '-'}</div>
-      <div class="muted">run_id: ${session.codebuffMetadata?.run_id || '-'}</div>
+      <div class="session-details">
+        <div>最近切换: ${formatDate(session.lastAccountSwitchAt)}</div>
+        <div>切换原因: ${session.lastAccountSwitchReason || '-'}</div>
+        <div>client_id: ${session.codebuffMetadata?.client_id || '-'}</div>
+        <div>run_id: ${session.codebuffMetadata?.run_id || '-'}</div>
+      </div>
     `
     els.sessionsList.append(card)
   }
@@ -570,12 +697,22 @@ function renderUsageRecords(records) {
   }
 }
 
+function updateTime() {
+  if (els.currentTime) {
+    const now = new Date()
+    els.currentTime.textContent = now.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+    if (els.usageUpdatedAt) {
+      els.usageUpdatedAt.textContent = `更新于：${now.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`
+    }
+  }
+}
+
 async function refreshOverview() {
   const overview = await request('/v1/freebuff/admin/overview', { headers: {} })
   state.overview = overview
   renderAccount(overview)
   renderConfig(overview)
-  renderSummary(overview.usage.summary)
+  renderSummary(overview.usage.summary, overview.usage.records)
   renderCompatibility(overview)
   renderSessions(overview)
   renderUsageRecords(overview.usage.records)
@@ -594,6 +731,7 @@ async function refreshLoginStatus() {
 async function refreshAll() {
   await refreshLoginStatus()
   await refreshOverview()
+  updateTime()
   const s = state.loginSession
   if (!autoPoll.timerId && s?.loginUrl && !s?.authenticated && !s?.expired) {
     startAutoPoll()
@@ -602,7 +740,7 @@ async function refreshAll() {
 
 async function refreshUsageOnly() {
   const data = await request('/v1/freebuff/usage')
-  renderSummary(data.summary)
+  renderSummary(data.summary, data.records)
   renderUsageRecords(data.records)
 }
 
@@ -640,7 +778,13 @@ els.configMode.addEventListener('change', async () => {
     fallbackModes[0]
   els.configModeHelp.textContent =
     modeDefinition?.description || '选择 Codebuff 模式；保存后会重建现有会话。'
-  els.configAgentId.textContent = modeDefinition?.agentId || '-'
+
+  if (els.pillMode) {
+    els.pillMode.textContent = modeDefinition?.label || selectedMode
+  }
+  if (els.pillAgent) {
+    els.pillAgent.textContent = modeDefinition?.agentId || '-'
+  }
 
   try {
     const res = await request(`/v1/freebuff/models?mode=${selectedMode}`)
@@ -781,6 +925,26 @@ els.sessionsList.addEventListener('click', async (event) => {
   }
 })
 
+setInterval(updateTime, 60000)
+
+function navigateTo(page) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'))
+  document.querySelectorAll('.top-nav-link').forEach(l => l.classList.remove('active'))
+  const targetPage = document.getElementById(`page-${page}`)
+  const targetLink = document.querySelector(`.top-nav-link[data-page="${page}"]`)
+  if (targetPage) targetPage.classList.add('active')
+  if (targetLink) targetLink.classList.add('active')
+}
+
+function handleHashRoute() {
+  const hash = location.hash.replace('#', '') || 'overview'
+  navigateTo(hash)
+}
+
+window.addEventListener('hashchange', handleHashRoute)
+
 refreshAll().catch((error) => {
   showToast(error.message, true)
 })
+
+handleHashRoute()
