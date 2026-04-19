@@ -1,9 +1,11 @@
 import { createServer } from 'node:http'
+import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { chromium } from 'playwright-core'
 
 const CONFIG = {
   port: Number(process.env.PORT || 8765),
@@ -28,6 +30,59 @@ const CONFIG = {
 
 const APP_DIR = path.dirname(fileURLToPath(import.meta.url))
 const PUBLIC_DIR = path.join(APP_DIR, 'public')
+const RUN_DIR = path.join(APP_DIR, 'run')
+
+const CHATGPT_WEB_DEFAULT_CHROME =
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+
+function readBooleanEnv(name, fallback = false) {
+  const raw = process.env[name]
+  if (raw == null) {
+    return fallback
+  }
+  return raw === '1' || raw === 'true'
+}
+
+const EXPERIMENTAL_CONFIG = {
+  enabled: readBooleanEnv('CHATGPT_WEB_EXPERIMENTAL_ENABLED', true),
+  modelAlias:
+    process.env.CHATGPT_WEB_MODEL_ALIAS || 'chatgpt-web-experimental',
+  targetModel:
+    process.env.CHATGPT_WEB_TARGET_MODEL || 'GPT-5.4 Pro',
+  baseUrl: process.env.CHATGPT_WEB_BASE_URL || 'https://chatgpt.com',
+  loginUrl:
+    process.env.CHATGPT_WEB_LOGIN_URL || 'https://chatgpt.com/auth/login',
+  chromeExecutable:
+    process.env.CHATGPT_WEB_CHROME_EXECUTABLE || CHATGPT_WEB_DEFAULT_CHROME,
+  profileDir:
+    process.env.CHATGPT_WEB_PROFILE_DIR ||
+    path.join(RUN_DIR, 'chatgpt-web-profile'),
+  sessionStorePath:
+    process.env.CHATGPT_WEB_SESSION_STORE ||
+    path.join(RUN_DIR, 'chatgpt-web-sessions.json'),
+  timeoutMs: Number(process.env.CHATGPT_WEB_TIMEOUT_MS || 300_000),
+  debuggingPort: Number(process.env.CHATGPT_WEB_DEBUGGING_PORT || 9222),
+  headless: readBooleanEnv('CHATGPT_WEB_HEADLESS', false),
+  debug: readBooleanEnv('CHATGPT_WEB_DEBUG', false),
+}
+
+const experimentalBridgeSessions = new Map()
+const experimentalPages = new Map()
+let experimentalSessionsLoaded = false
+let experimentalBrowser = null
+let experimentalBrowserContext = null
+let experimentalBrowserContextPromise = null
+let experimentalChromeProcess = null
+let experimentalQueue = Promise.resolve()
+let experimentalQueueDepth = 0
+const experimentalRuntime = {
+  browserStarted: false,
+  authenticated: false,
+  lastError: null,
+  lastErrorCode: null,
+  lastObservedAt: null,
+  lastResponseAt: null,
+}
 
 // --- Structured logger ---
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 }
@@ -345,6 +400,16 @@ function safeSessionName(raw) {
   )}`
 }
 
+function safeExperimentalSessionName(raw) {
+  const normalized = String(raw || CONFIG.defaultSessionId).replace(
+    /[^a-zA-Z0-9_-]/g,
+    '-',
+  )
+  return normalized.startsWith('chatgpt-web-experimental-')
+    ? normalized
+    : `chatgpt-web-experimental-${normalized}`
+}
+
 function normalizeText(text) {
   return String(text || '').replace(/\r/g, '').trim()
 }
@@ -364,6 +429,10 @@ function stripTrailingWhitespace(text) {
     .map((line) => line.replace(/\s+$/g, ''))
     .join('\n')
     .trim()
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function getContentType(filePath) {
@@ -1039,6 +1108,7 @@ function resetSessionRunState(session, reason = null) {
   session.runId = null
   session.updatedAt = new Date().toISOString()
   session.lastError = reason
+  clearFreebuffSession(session)
 }
 
 function bindSessionToAccount(session, account, reason = null) {
@@ -1142,6 +1212,15 @@ async function finishSessionRun(authToken, session, status = 'cancelled') {
     })
   } catch (error) {
     logger.error('session', 'finishSessionRun failed', { runId: session.runId, error: error?.message })
+  }
+
+  if (session?.costMode === 'free' && session?.freebuffInstanceId) {
+    try {
+      await deleteFreebuffSession(authToken, session.freebuffInstanceId)
+      clearFreebuffSession(session)
+    } catch (error) {
+      logger.error('session', 'deleteFreebuffSession failed', { session: session.session, instanceId: session.freebuffInstanceId, error: error?.message })
+    }
   }
 }
 
@@ -2154,6 +2233,1639 @@ function buildModelsResponse() {
   }
 }
 
+const CHATGPT_WEB_PROMPT_SELECTORS = [
+  '#prompt-textarea',
+  'textarea#prompt-textarea',
+  'textarea[placeholder*="Message"]',
+  'div[contenteditable="true"][data-testid="prompt-textarea"]',
+  'div[contenteditable="true"][data-placeholder]',
+]
+
+const CHATGPT_WEB_SEND_SELECTORS = [
+  'button[data-testid="send-button"]',
+  'button[aria-label*="Send"]',
+  'button[aria-label*="发送"]',
+]
+
+const CHATGPT_WEB_STOP_SELECTORS = [
+  'button[data-testid="stop-button"]',
+  'button[aria-label*="Stop"]',
+  'button[aria-label*="停止"]',
+]
+
+const CHATGPT_WEB_LOGIN_SELECTORS = [
+  'input[type="email"]',
+  'input[name="email"]',
+  'button[data-testid="login-button"]',
+  'a[href*="/auth/login"]',
+  'a[href*="/login"]',
+]
+
+const CHATGPT_WEB_ASSISTANT_SELECTORS = [
+  '[data-message-author-role="assistant"]',
+  'article[data-testid*="conversation-turn"]',
+]
+
+const CHATGPT_WEB_MODEL_PICKER_SELECTORS = [
+  'button[data-testid="model-switcher-dropdown-button"]',
+  'button[aria-haspopup="menu"]',
+  'button[aria-label*="model"]',
+]
+
+function buildExperimentalModelsResponse() {
+  return {
+    data: [
+      {
+        type: 'model',
+        id: EXPERIMENTAL_CONFIG.modelAlias,
+        display_name: EXPERIMENTAL_CONFIG.modelAlias,
+        created_at: '2026-04-18T00:00:00Z',
+      },
+    ],
+    has_more: false,
+    first_id: EXPERIMENTAL_CONFIG.modelAlias,
+    last_id: EXPERIMENTAL_CONFIG.modelAlias,
+  }
+}
+
+function createExperimentalError(
+  message,
+  statusCode = 500,
+  errorCode = 'chatgpt_web_error',
+  errorType = null,
+) {
+  const error = new Error(message)
+  error.statusCode = statusCode
+  error.errorCode = errorCode
+  error.errorType =
+    errorType ||
+    (statusCode === 401
+      ? 'authentication_error'
+      : statusCode === 400
+        ? 'invalid_request_error'
+        : statusCode === 404
+          ? 'not_found_error'
+          : statusCode === 409
+            ? 'invalid_request_error'
+            : statusCode === 504
+              ? 'timeout_error'
+              : 'server_error')
+  return error
+}
+
+function noteExperimentalError(error) {
+  experimentalRuntime.lastError = error?.message || 'Unknown experimental bridge error.'
+  experimentalRuntime.lastErrorCode = error?.errorCode || 'chatgpt_web_error'
+  experimentalRuntime.lastObservedAt = new Date().toISOString()
+}
+
+function clearExperimentalError() {
+  experimentalRuntime.lastError = null
+  experimentalRuntime.lastErrorCode = null
+  experimentalRuntime.lastObservedAt = new Date().toISOString()
+}
+
+function ensureExperimentalEnabled() {
+  if (!EXPERIMENTAL_CONFIG.enabled) {
+    throw createExperimentalError(
+      'ChatGPT 网页实验桥当前未启用。',
+      404,
+      'chatgpt_web_disabled',
+      'not_found_error',
+    )
+  }
+}
+
+function ensureExperimentalDirs() {
+  fs.mkdirSync(RUN_DIR, { recursive: true })
+  fs.mkdirSync(EXPERIMENTAL_CONFIG.profileDir, { recursive: true })
+  fs.mkdirSync(path.dirname(EXPERIMENTAL_CONFIG.sessionStorePath), {
+    recursive: true,
+  })
+}
+
+function experimentalModelSlug() {
+  return EXPERIMENTAL_CONFIG.targetModel
+    .toLowerCase()
+    .replace(/\s+/g, '-')
+}
+
+function buildExperimentalConversationStartUrl() {
+  const url = new URL('/', EXPERIMENTAL_CONFIG.baseUrl)
+  url.searchParams.set('model', experimentalModelSlug())
+  return url.toString()
+}
+
+function normalizeExperimentalTranscriptState(transcript) {
+  const systemText =
+    typeof transcript?.systemText === 'string'
+      ? stripTrailingWhitespace(transcript.systemText)
+      : ''
+  const messages = Array.isArray(transcript?.messages)
+    ? transcript.messages
+        .map((message) => ({
+          role: message?.role === 'assistant' ? 'assistant' : 'user',
+          text:
+            typeof message?.text === 'string'
+              ? stripTrailingWhitespace(message.text)
+              : '',
+        }))
+        .filter((message) => message.text)
+    : []
+
+  return {
+    systemText,
+    messages,
+  }
+}
+
+function createExperimentalSessionRecord(sessionName) {
+  const now = new Date().toISOString()
+  return {
+    session: sessionName,
+    conversationUrl: null,
+    transcript: normalizeExperimentalTranscriptState(null),
+    createdAt: now,
+    updatedAt: now,
+    lastRequestAt: null,
+    lastResponseAt: null,
+    lastError: null,
+  }
+}
+
+function normalizeExperimentalSessionRecord(record) {
+  if (!record || typeof record !== 'object') {
+    return null
+  }
+
+  return {
+    session: safeExperimentalSessionName(record.session),
+    conversationUrl:
+      typeof record.conversationUrl === 'string' && record.conversationUrl.trim()
+        ? record.conversationUrl.trim()
+        : null,
+    transcript: normalizeExperimentalTranscriptState(record.transcript),
+    createdAt:
+      typeof record.createdAt === 'string' && record.createdAt
+        ? record.createdAt
+        : new Date().toISOString(),
+    updatedAt:
+      typeof record.updatedAt === 'string' && record.updatedAt
+        ? record.updatedAt
+        : new Date().toISOString(),
+    lastRequestAt:
+      typeof record.lastRequestAt === 'string' && record.lastRequestAt
+        ? record.lastRequestAt
+        : null,
+    lastResponseAt:
+      typeof record.lastResponseAt === 'string' && record.lastResponseAt
+        ? record.lastResponseAt
+        : null,
+    lastError:
+      typeof record.lastError === 'string' && record.lastError
+        ? record.lastError
+        : null,
+  }
+}
+
+function loadExperimentalSessionsFromDisk() {
+  ensureExperimentalDirs()
+  experimentalBridgeSessions.clear()
+  if (!fs.existsSync(EXPERIMENTAL_CONFIG.sessionStorePath)) {
+    experimentalSessionsLoaded = true
+    return
+  }
+
+  try {
+    const raw = JSON.parse(
+      fs.readFileSync(EXPERIMENTAL_CONFIG.sessionStorePath, 'utf8'),
+    )
+    const records = Array.isArray(raw)
+      ? raw
+      : Array.isArray(raw?.sessions)
+        ? raw.sessions
+        : []
+    for (const record of records) {
+      const normalized = normalizeExperimentalSessionRecord(record)
+      if (normalized) {
+        experimentalBridgeSessions.set(normalized.session, normalized)
+      }
+    }
+    experimentalSessionsLoaded = true
+  } catch (error) {
+    experimentalSessionsLoaded = true
+    noteExperimentalError(
+      createExperimentalError(
+        `读取 ChatGPT 网页实验会话失败：${error?.message || '未知错误'}`,
+        500,
+        'chatgpt_web_session_store_invalid',
+      ),
+    )
+  }
+}
+
+function ensureExperimentalSessionsLoaded() {
+  if (!experimentalSessionsLoaded) {
+    loadExperimentalSessionsFromDisk()
+  }
+}
+
+function saveExperimentalSessionsToDisk() {
+  ensureExperimentalDirs()
+  const sessions = Array.from(experimentalBridgeSessions.values()).map(
+    (session) => ({
+      session: session.session,
+      conversationUrl: session.conversationUrl,
+      transcript: session.transcript,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      lastRequestAt: session.lastRequestAt,
+      lastResponseAt: session.lastResponseAt,
+      lastError: session.lastError,
+    }),
+  )
+  fs.writeFileSync(
+    EXPERIMENTAL_CONFIG.sessionStorePath,
+    JSON.stringify(
+      {
+        updatedAt: new Date().toISOString(),
+        sessions,
+      },
+      null,
+      2,
+    ),
+  )
+}
+
+function getOrCreateExperimentalSession(sessionName) {
+  ensureExperimentalSessionsLoaded()
+  let session = experimentalBridgeSessions.get(sessionName)
+  if (!session) {
+    session = createExperimentalSessionRecord(sessionName)
+    experimentalBridgeSessions.set(sessionName, session)
+    saveExperimentalSessionsToDisk()
+  }
+  return session
+}
+
+function persistExperimentalSession(session, updates = {}) {
+  const next = {
+    ...session,
+    ...updates,
+    updatedAt: new Date().toISOString(),
+  }
+  experimentalBridgeSessions.set(next.session, next)
+  saveExperimentalSessionsToDisk()
+  return next
+}
+
+async function disposeExperimentalPage(sessionName) {
+  const page = experimentalPages.get(sessionName)
+  experimentalPages.delete(sessionName)
+  if (page && !page.isClosed()) {
+    await page.close().catch(() => {})
+  }
+}
+
+async function resetExperimentalSessionState(sessionName, removeRecord = false) {
+  ensureExperimentalSessionsLoaded()
+  await disposeExperimentalPage(sessionName)
+  if (removeRecord) {
+    experimentalBridgeSessions.delete(sessionName)
+  } else {
+    const current = getOrCreateExperimentalSession(sessionName)
+    persistExperimentalSession(current, {
+      conversationUrl: null,
+      transcript: normalizeExperimentalTranscriptState(null),
+      lastError: null,
+      lastRequestAt: null,
+      lastResponseAt: null,
+    })
+  }
+  saveExperimentalSessionsToDisk()
+}
+
+function listExperimentalSessions() {
+  ensureExperimentalSessionsLoaded()
+  return Array.from(experimentalBridgeSessions.values())
+    .sort((left, right) => left.session.localeCompare(right.session))
+    .map((session) => ({
+      session: session.session,
+      conversationUrl: session.conversationUrl,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      lastRequestAt: session.lastRequestAt,
+      lastResponseAt: session.lastResponseAt,
+      lastError: session.lastError,
+      historyLength: session.transcript.messages.length,
+      pageOpen:
+        experimentalPages.has(session.session) &&
+        !experimentalPages.get(session.session)?.isClosed(),
+    }))
+}
+
+function withExperimentalQueue(work) {
+  experimentalQueueDepth += 1
+  const current = experimentalQueue
+    .catch(() => {})
+    .then(work)
+    .finally(() => {
+      experimentalQueueDepth = Math.max(0, experimentalQueueDepth - 1)
+    })
+  experimentalQueue = current
+  return current
+}
+
+function resetExperimentalBrowserState() {
+  experimentalBrowser = null
+  experimentalBrowserContext = null
+  experimentalBrowserContextPromise = null
+  experimentalRuntime.browserStarted = false
+  experimentalRuntime.authenticated = false
+  experimentalPages.clear()
+}
+
+function buildExperimentalCdpBaseUrl() {
+  return `http://127.0.0.1:${EXPERIMENTAL_CONFIG.debuggingPort}`
+}
+
+async function waitForExperimentalCdpEndpoint(timeoutMs = 15_000) {
+  const startedAt = Date.now()
+  const endpoint = `${buildExperimentalCdpBaseUrl()}/json/version`
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const response = await fetch(endpoint, {
+        signal: AbortSignal.timeout(2_000),
+      })
+      if (response.ok) {
+        return endpoint
+      }
+    } catch {}
+    await delay(250)
+  }
+
+  throw createExperimentalError(
+    '启动 Chrome 调试端口超时。',
+    500,
+    'chatgpt_web_debugging_port_timeout',
+  )
+}
+
+function buildExperimentalChromeArgs() {
+  const args = [
+    `--remote-debugging-port=${EXPERIMENTAL_CONFIG.debuggingPort}`,
+    `--user-data-dir=${EXPERIMENTAL_CONFIG.profileDir}`,
+    '--no-first-run',
+    '--disable-dev-shm-usage',
+    '--disable-blink-features=AutomationControlled',
+    '--new-window',
+    EXPERIMENTAL_CONFIG.loginUrl,
+  ]
+  if (EXPERIMENTAL_CONFIG.headless) {
+    args.unshift('--headless=new')
+  }
+  return args
+}
+
+function startExperimentalChromeProcess() {
+  if (experimentalChromeProcess) {
+    return experimentalChromeProcess
+  }
+
+  experimentalChromeProcess = spawn(
+    EXPERIMENTAL_CONFIG.chromeExecutable,
+    buildExperimentalChromeArgs(),
+    {
+      stdio: EXPERIMENTAL_CONFIG.debug ? 'inherit' : 'ignore',
+      detached: false,
+    },
+  )
+
+  experimentalChromeProcess.once('exit', () => {
+    experimentalChromeProcess = null
+    resetExperimentalBrowserState()
+  })
+
+  experimentalChromeProcess.once('error', () => {
+    experimentalChromeProcess = null
+    resetExperimentalBrowserState()
+  })
+
+  return experimentalChromeProcess
+}
+
+async function connectExperimentalBrowserContext() {
+  await waitForExperimentalCdpEndpoint()
+  const browser = await chromium.connectOverCDP(buildExperimentalCdpBaseUrl())
+  const context = browser.contexts()[0]
+  if (!context) {
+    await browser.close().catch(() => {})
+    throw createExperimentalError(
+      '连接 Chrome 成功，但没有拿到默认浏览器上下文。',
+      500,
+      'chatgpt_web_missing_context',
+    )
+  }
+
+  experimentalBrowser = browser
+  experimentalBrowserContext = context
+  experimentalRuntime.browserStarted = true
+
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', {
+      get: () => undefined,
+    })
+  }).catch(() => {})
+
+  const pages = context.pages()
+  for (const page of pages) {
+    page.setDefaultTimeout(EXPERIMENTAL_CONFIG.timeoutMs)
+    page.setDefaultNavigationTimeout(EXPERIMENTAL_CONFIG.timeoutMs)
+  }
+
+  context.on('page', (page) => {
+    page.setDefaultTimeout(EXPERIMENTAL_CONFIG.timeoutMs)
+    page.setDefaultNavigationTimeout(EXPERIMENTAL_CONFIG.timeoutMs)
+  })
+
+  browser.on('disconnected', () => {
+    resetExperimentalBrowserState()
+  })
+
+  return context
+}
+
+async function ensureExperimentalBrowserContext() {
+  ensureExperimentalEnabled()
+  ensureExperimentalDirs()
+
+  if (experimentalBrowserContext) {
+    experimentalRuntime.browserStarted = true
+    return experimentalBrowserContext
+  }
+
+  if (experimentalBrowserContextPromise) {
+    return experimentalBrowserContextPromise
+  }
+
+  if (!fs.existsSync(EXPERIMENTAL_CONFIG.chromeExecutable)) {
+    throw createExperimentalError(
+      `找不到 Chrome 可执行文件：${EXPERIMENTAL_CONFIG.chromeExecutable}`,
+      500,
+      'chatgpt_web_chrome_missing',
+    )
+  }
+
+  experimentalBrowserContextPromise = (async () => {
+    try {
+      try {
+        return await connectExperimentalBrowserContext()
+      } catch {
+        startExperimentalChromeProcess()
+        return await connectExperimentalBrowserContext()
+      }
+    } catch (error) {
+      resetExperimentalBrowserState()
+      throw createExperimentalError(
+        `启动 ChatGPT 网页实验桥失败：${error?.message || '未知错误'}`,
+        500,
+        'chatgpt_web_browser_start_failed',
+      )
+    }
+  })()
+    .catch((error) => {
+      experimentalBrowserContextPromise = null
+      throw error
+    })
+
+  return experimentalBrowserContextPromise
+}
+
+async function getExperimentalStatusPage(navigateIfBlank = true) {
+  const context = await ensureExperimentalBrowserContext()
+  let page = context.pages().find((candidate) => !candidate.isClosed()) || null
+  if (!page) {
+    page = await context.newPage()
+  }
+  await page.setViewportSize({ width: 1440, height: 960 }).catch(() => {})
+  page.setDefaultTimeout(EXPERIMENTAL_CONFIG.timeoutMs)
+  page.setDefaultNavigationTimeout(EXPERIMENTAL_CONFIG.timeoutMs)
+  if (navigateIfBlank && (!page.url() || page.url() === 'about:blank')) {
+    await page.goto(EXPERIMENTAL_CONFIG.loginUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: EXPERIMENTAL_CONFIG.timeoutMs,
+    })
+  }
+  return page
+}
+
+async function findExperimentalSelector(page, selectors) {
+  return page
+    .evaluate((selectorList) => {
+      const isVisible = (element) => {
+        if (!element) {
+          return false
+        }
+        const rect = element.getBoundingClientRect()
+        const style = window.getComputedStyle(element)
+        return (
+          style &&
+          style.display !== 'none' &&
+          style.visibility !== 'hidden' &&
+          rect.width >= 0 &&
+          rect.height >= 0
+        )
+      }
+
+      for (const selector of selectorList) {
+        try {
+          const element = document.querySelector(selector)
+          if (isVisible(element) || element) {
+            return selector
+          }
+        } catch {}
+      }
+      return null
+    }, selectors)
+    .catch(() => null)
+}
+
+async function pageBodyIncludes(page, text) {
+  return page
+    .evaluate((needle) => {
+      return (document.body?.innerText || '').includes(needle)
+    }, text)
+    .catch(() => false)
+}
+
+async function isExperimentalChallengePage(page) {
+  const title = await page.title().catch(() => '')
+  if (title.includes('请稍候') || title.toLowerCase().includes('just a moment')) {
+    return true
+  }
+  return (
+    (await pageBodyIncludes(page, '请稍候')) ||
+    (await pageBodyIncludes(page, 'Checking your browser')) ||
+    (await pageBodyIncludes(page, 'Verify you are human'))
+  )
+}
+
+async function waitForExperimentalPromptOrLogin(page) {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < Math.min(20_000, EXPERIMENTAL_CONFIG.timeoutMs)) {
+    if (await isExperimentalChallengePage(page)) {
+      return {
+        authenticated: false,
+        challengeBlocked: true,
+      }
+    }
+
+    const promptSelector = await findExperimentalSelector(
+      page,
+      CHATGPT_WEB_PROMPT_SELECTORS,
+    )
+    if (promptSelector) {
+      return {
+        authenticated: true,
+        promptSelector,
+      }
+    }
+
+    const loginSelector = await findExperimentalSelector(
+      page,
+      CHATGPT_WEB_LOGIN_SELECTORS,
+    )
+    if (loginSelector) {
+      return {
+        authenticated: false,
+        loginSelector,
+      }
+    }
+
+    await delay(500)
+  }
+
+  return {
+    authenticated: false,
+    promptSelector: null,
+    loginSelector: null,
+    challengeBlocked: false,
+  }
+}
+
+async function probeExperimentalAuthentication({ openHome = false } = {}) {
+  ensureExperimentalEnabled()
+  if (!experimentalBrowserContext && !openHome) {
+    return false
+  }
+
+  const page = await getExperimentalStatusPage(openHome)
+  if (!openHome && (!page.url() || page.url() === 'about:blank')) {
+    experimentalRuntime.browserStarted = true
+    experimentalRuntime.authenticated = false
+    experimentalRuntime.lastObservedAt = new Date().toISOString()
+    return false
+  }
+
+  if (openHome && !page.url().startsWith(EXPERIMENTAL_CONFIG.baseUrl)) {
+    await page.goto(EXPERIMENTAL_CONFIG.loginUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: EXPERIMENTAL_CONFIG.timeoutMs,
+    })
+  }
+
+  const authState = await waitForExperimentalPromptOrLogin(page)
+  experimentalRuntime.browserStarted = true
+  experimentalRuntime.authenticated = authState.authenticated === true
+  experimentalRuntime.lastObservedAt = new Date().toISOString()
+  return authState.authenticated === true
+}
+
+async function ensureExperimentalAuthenticatedPage(page) {
+  const authState = await waitForExperimentalPromptOrLogin(page)
+  experimentalRuntime.browserStarted = true
+  experimentalRuntime.authenticated = authState.authenticated === true
+  experimentalRuntime.lastObservedAt = new Date().toISOString()
+  if (authState.authenticated && authState.promptSelector) {
+    return authState.promptSelector
+  }
+  if (authState.challengeBlocked) {
+    throw createExperimentalError(
+      'ChatGPT 当前把这个浏览器识别成受控环境，页面停在“请稍候”验证页，暂时无法完成登录。',
+      409,
+      'chatgpt_web_challenge_blocked',
+    )
+  }
+  if (authState.loginSelector) {
+    throw createExperimentalError(
+      'ChatGPT 网页尚未登录，请先启动浏览器并手动完成登录。',
+      401,
+      'chatgpt_web_not_authenticated',
+    )
+  }
+  throw createExperimentalError(
+    'ChatGPT 页面结构可能已变化，暂时找不到输入区域。',
+    502,
+    'chatgpt_web_dom_changed',
+  )
+}
+
+async function tryClickElementWithText(page, text) {
+  return page
+    .evaluate((needle) => {
+      const candidates = Array.from(
+        document.querySelectorAll(
+          'button, [role="menuitem"], [role="option"], li, a, div',
+        ),
+      )
+      const target = candidates.find((element) =>
+        (element.textContent || '').trim().includes(needle),
+      )
+      if (!target) {
+        return false
+      }
+      target.click()
+      return true
+    }, text)
+    .catch(() => false)
+}
+
+async function ensureExperimentalModel(page) {
+  const targetUrl = buildExperimentalConversationStartUrl()
+  await page.goto(targetUrl, {
+    waitUntil: 'domcontentloaded',
+    timeout: EXPERIMENTAL_CONFIG.timeoutMs,
+  })
+
+  await ensureExperimentalAuthenticatedPage(page)
+  if (
+    (await pageBodyIncludes(page, EXPERIMENTAL_CONFIG.targetModel)) ||
+    page.url().includes(`model=${experimentalModelSlug()}`)
+  ) {
+    return
+  }
+
+  const pickerSelector = await findExperimentalSelector(
+    page,
+    CHATGPT_WEB_MODEL_PICKER_SELECTORS,
+  )
+  if (pickerSelector) {
+    await page.click(pickerSelector).catch(() => {})
+    await delay(500)
+    await tryClickElementWithText(page, EXPERIMENTAL_CONFIG.targetModel)
+    await delay(500)
+  }
+
+  if (
+    !(await pageBodyIncludes(page, EXPERIMENTAL_CONFIG.targetModel)) &&
+    !page.url().includes(`model=${experimentalModelSlug()}`)
+  ) {
+    throw createExperimentalError(
+      `当前 ChatGPT 网页里找不到模型 ${EXPERIMENTAL_CONFIG.targetModel}。`,
+      409,
+      'chatgpt_web_model_unavailable',
+    )
+  }
+}
+
+async function getExperimentalPageForSession(
+  session,
+  forceFreshConversation = false,
+) {
+  const context = await ensureExperimentalBrowserContext()
+  let page = experimentalPages.get(session.session)
+  if (page && page.isClosed()) {
+    experimentalPages.delete(session.session)
+    page = null
+  }
+
+  if (forceFreshConversation && page) {
+    await disposeExperimentalPage(session.session)
+    page = null
+  }
+
+  if (!page) {
+    page = await context.newPage()
+    page.setDefaultTimeout(EXPERIMENTAL_CONFIG.timeoutMs)
+    page.setDefaultNavigationTimeout(EXPERIMENTAL_CONFIG.timeoutMs)
+    experimentalPages.set(session.session, page)
+  }
+
+  if (forceFreshConversation || !session.conversationUrl) {
+    await ensureExperimentalModel(page)
+  } else if (page.url() !== session.conversationUrl) {
+    await page.goto(session.conversationUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: EXPERIMENTAL_CONFIG.timeoutMs,
+    })
+    await ensureExperimentalAuthenticatedPage(page)
+  } else {
+    await ensureExperimentalAuthenticatedPage(page)
+  }
+
+  await page.bringToFront().catch(() => {})
+  return page
+}
+
+function createTextOnlyInputError() {
+  return createExperimentalError(
+    'ChatGPT 网页实验桥目前只支持纯文本输入，不支持工具、图片、文件或音频。',
+    400,
+    'chatgpt_web_text_only',
+  )
+}
+
+function normalizeExperimentalAnthropicContent(content) {
+  if (typeof content === 'string') {
+    return stripTrailingWhitespace(content)
+  }
+
+  if (!Array.isArray(content)) {
+    return ''
+  }
+
+  const parts = []
+  for (const item of content) {
+    if (typeof item === 'string') {
+      parts.push(item)
+      continue
+    }
+    if (item?.type === 'text' && typeof item.text === 'string') {
+      parts.push(item.text)
+      continue
+    }
+    throw createTextOnlyInputError()
+  }
+  return stripTrailingWhitespace(parts.join('\n'))
+}
+
+function normalizeExperimentalOpenAIContent(content) {
+  if (typeof content === 'string') {
+    return stripTrailingWhitespace(content)
+  }
+
+  if (!Array.isArray(content)) {
+    return ''
+  }
+
+  const parts = []
+  for (const item of content) {
+    if (typeof item === 'string') {
+      parts.push(item)
+      continue
+    }
+    if (
+      (item?.type === 'text' || item?.type === 'input_text') &&
+      typeof item.text === 'string'
+    ) {
+      parts.push(item.text)
+      continue
+    }
+    throw createTextOnlyInputError()
+  }
+  return stripTrailingWhitespace(parts.join('\n'))
+}
+
+function buildExperimentalAnthropicTranscript(body = {}) {
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    throw createTextOnlyInputError()
+  }
+  if (body.tool_choice) {
+    throw createTextOnlyInputError()
+  }
+
+  const transcript = {
+    systemText: normalizeAnthropicSystem(body.system),
+    messages: [],
+  }
+
+  for (const message of Array.isArray(body.messages) ? body.messages : []) {
+    if (message?.role !== 'user' && message?.role !== 'assistant') {
+      if (message?.role === 'tool') {
+        throw createTextOnlyInputError()
+      }
+      continue
+    }
+
+    const text = normalizeExperimentalAnthropicContent(message.content)
+    if (text) {
+      transcript.messages.push({
+        role: message.role,
+        text,
+      })
+    }
+  }
+
+  if (transcript.messages.length === 0) {
+    throw createExperimentalError(
+      'ChatGPT 网页实验桥至少需要一条文本消息。',
+      400,
+      'chatgpt_web_empty_prompt',
+    )
+  }
+
+  return normalizeExperimentalTranscriptState(transcript)
+}
+
+function buildExperimentalOpenAITranscript(body = {}) {
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    throw createTextOnlyInputError()
+  }
+  if (body.response_format) {
+    throw createTextOnlyInputError()
+  }
+
+  const transcript = {
+    systemText: '',
+    messages: [],
+  }
+
+  for (const message of Array.isArray(body.messages) ? body.messages : []) {
+    if (Array.isArray(message?.tool_calls) && message.tool_calls.length > 0) {
+      throw createTextOnlyInputError()
+    }
+    if (message?.role === 'tool') {
+      throw createTextOnlyInputError()
+    }
+
+    const text = normalizeExperimentalOpenAIContent(message?.content)
+    if (!text) {
+      continue
+    }
+
+    if (message.role === 'system' || message.role === 'developer') {
+      transcript.systemText = [transcript.systemText, text]
+        .filter(Boolean)
+        .join('\n\n')
+      continue
+    }
+
+    if (message.role !== 'user' && message.role !== 'assistant') {
+      continue
+    }
+
+    transcript.messages.push({
+      role: message.role,
+      text,
+    })
+  }
+
+  if (transcript.messages.length === 0) {
+    throw createExperimentalError(
+      'ChatGPT 网页实验桥至少需要一条文本消息。',
+      400,
+      'chatgpt_web_empty_prompt',
+    )
+  }
+
+  return normalizeExperimentalTranscriptState(transcript)
+}
+
+function transcriptStartsWith(previous, next) {
+  if (!previous || !next) {
+    return false
+  }
+  if ((previous.systemText || '') !== (next.systemText || '')) {
+    return false
+  }
+  if (previous.messages.length > next.messages.length) {
+    return false
+  }
+  return previous.messages.every(
+    (message, index) =>
+      message.role === next.messages[index]?.role &&
+      message.text === next.messages[index]?.text,
+  )
+}
+
+function buildReplayPrompt(transcript) {
+  const sections = []
+  if (transcript.systemText) {
+    sections.push(`系统要求：\n${transcript.systemText}`)
+  }
+  sections.push(
+    transcript.messages
+      .map((message) => {
+        const roleLabel = message.role === 'assistant' ? '助手' : '用户'
+        return `${roleLabel}：\n${message.text}`
+      })
+      .join('\n\n'),
+  )
+  sections.push('请继续这段对话，并只输出下一条助手回复。不要解释这些角色标签。')
+  return sections.filter(Boolean).join('\n\n')
+}
+
+function buildExperimentalPromptPlan(session, transcript) {
+  const previous = normalizeExperimentalTranscriptState(session.transcript)
+  const hasConversation = Boolean(session.conversationUrl)
+
+  if (
+    !hasConversation &&
+    !previous.systemText &&
+    previous.messages.length === 0 &&
+    !transcript.systemText &&
+    transcript.messages.length === 1 &&
+    transcript.messages[0].role === 'user'
+  ) {
+    return {
+      prompt: transcript.messages[0].text,
+      resetConversation: false,
+    }
+  }
+
+  if (!transcriptStartsWith(previous, transcript)) {
+    return {
+      prompt: buildReplayPrompt(transcript),
+      resetConversation: hasConversation,
+    }
+  }
+
+  const delta = transcript.messages.slice(previous.messages.length)
+  if (delta.length === 1 && delta[0].role === 'user') {
+    return {
+      prompt: delta[0].text,
+      resetConversation: false,
+    }
+  }
+
+  return {
+    prompt: buildReplayPrompt(transcript),
+    resetConversation: hasConversation,
+  }
+}
+
+async function setPromptText(page, selector, text) {
+  const element = await page.$(selector)
+  if (!element) {
+    throw createExperimentalError(
+      'ChatGPT 页面结构可能已变化，暂时找不到输入框。',
+      502,
+      'chatgpt_web_dom_changed',
+    )
+  }
+
+  const tagName = await element.evaluate((node) => node.tagName.toLowerCase())
+  if (tagName === 'textarea') {
+    await page.fill(selector, text)
+    return
+  }
+
+  await page.click(selector)
+  await page.keyboard.press(`${process.platform === 'darwin' ? 'Meta' : 'Control'}+A`).catch(() => {})
+  await page.keyboard.press('Backspace').catch(() => {})
+  await page.keyboard.insertText(text)
+}
+
+async function submitExperimentalPrompt(page, prompt) {
+  const promptSelector = await ensureExperimentalAuthenticatedPage(page)
+  await setPromptText(page, promptSelector, prompt)
+
+  const sendSelector = await findExperimentalSelector(
+    page,
+    CHATGPT_WEB_SEND_SELECTORS,
+  )
+  if (sendSelector) {
+    await page.click(sendSelector).catch(() => {})
+  } else {
+    await page.keyboard.press('Enter')
+  }
+}
+
+async function collectAssistantMessages(page) {
+  return page
+    .evaluate((selectors) => {
+      const values = []
+      const seen = new Set()
+      for (const selector of selectors) {
+        const nodes = Array.from(document.querySelectorAll(selector))
+        for (const node of nodes) {
+          const text = String(node.innerText || node.textContent || '')
+            .replace(/\r/g, '')
+            .trim()
+          if (!text || seen.has(text)) {
+            continue
+          }
+          seen.add(text)
+          values.push(text)
+        }
+      }
+      return values
+    }, CHATGPT_WEB_ASSISTANT_SELECTORS)
+    .catch(() => [])
+}
+
+async function hasExperimentalStopButton(page) {
+  const selector = await findExperimentalSelector(page, CHATGPT_WEB_STOP_SELECTORS)
+  return Boolean(selector)
+}
+
+async function captureExperimentalBaseline(page) {
+  const assistantMessages = await collectAssistantMessages(page)
+  return {
+    count: assistantMessages.length,
+    lastText: assistantMessages.at(-1) || '',
+  }
+}
+
+async function captureExperimentalResponseSnapshot(page, baseline) {
+  const assistantMessages = await collectAssistantMessages(page)
+  const latestText = assistantMessages.at(-1) || ''
+  const started =
+    assistantMessages.length > baseline.count ||
+    (assistantMessages.length === baseline.count &&
+      latestText &&
+      latestText !== baseline.lastText)
+
+  return {
+    started,
+    text: started ? latestText : '',
+    assistantCount: assistantMessages.length,
+    generating: await hasExperimentalStopButton(page),
+    conversationUrl: page.url(),
+  }
+}
+
+function incrementalText(previous, next) {
+  if (!next) {
+    return ''
+  }
+  if (!previous) {
+    return next
+  }
+  if (next.startsWith(previous)) {
+    return next.slice(previous.length)
+  }
+  let index = 0
+  while (
+    index < previous.length &&
+    index < next.length &&
+    previous[index] === next[index]
+  ) {
+    index += 1
+  }
+  return next.slice(index)
+}
+
+async function waitForExperimentalResponse(page, baseline) {
+  const startedAt = Date.now()
+  let seenStart = false
+  let previousText = ''
+  let stablePolls = 0
+
+  while (Date.now() - startedAt < EXPERIMENTAL_CONFIG.timeoutMs) {
+    const snapshot = await captureExperimentalResponseSnapshot(page, baseline)
+    if (snapshot.started) {
+      seenStart = true
+    }
+    if (snapshot.text && snapshot.text !== previousText) {
+      previousText = snapshot.text
+      stablePolls = 0
+    } else if (snapshot.text) {
+      stablePolls += 1
+    }
+
+    if (seenStart && snapshot.text && !snapshot.generating && stablePolls >= 3) {
+      return snapshot
+    }
+
+    await delay(700)
+  }
+
+  throw createExperimentalError(
+    '等待 ChatGPT 网页响应超时。',
+    504,
+    'chatgpt_web_timeout',
+  )
+}
+
+async function streamExperimentalResponse(page, baseline, onDelta) {
+  const startedAt = Date.now()
+  let seenStart = false
+  let emittedText = ''
+  let previousText = ''
+  let stablePolls = 0
+
+  while (Date.now() - startedAt < EXPERIMENTAL_CONFIG.timeoutMs) {
+    const snapshot = await captureExperimentalResponseSnapshot(page, baseline)
+    if (snapshot.started) {
+      seenStart = true
+    }
+
+    if (snapshot.text) {
+      const delta = incrementalText(emittedText, snapshot.text)
+      if (delta) {
+        emittedText = snapshot.text
+        await onDelta(delta)
+      }
+    }
+
+    if (snapshot.text && snapshot.text !== previousText) {
+      previousText = snapshot.text
+      stablePolls = 0
+    } else if (snapshot.text) {
+      stablePolls += 1
+    }
+
+    if (seenStart && snapshot.text && !snapshot.generating && stablePolls >= 3) {
+      return {
+        ...snapshot,
+        text: emittedText || snapshot.text,
+      }
+    }
+
+    await delay(600)
+  }
+
+  throw createExperimentalError(
+    '等待 ChatGPT 网页流式响应超时。',
+    504,
+    'chatgpt_web_timeout',
+  )
+}
+
+async function prepareExperimentalExecution(sessionName, transcript) {
+  const session = getOrCreateExperimentalSession(sessionName)
+  const promptPlan = buildExperimentalPromptPlan(session, transcript)
+  if (promptPlan.resetConversation) {
+    await resetExperimentalSessionState(sessionName, false)
+  }
+
+  const activeSession = getOrCreateExperimentalSession(sessionName)
+  const page = await getExperimentalPageForSession(
+    activeSession,
+    promptPlan.resetConversation || !activeSession.conversationUrl,
+  )
+  const baseline = await captureExperimentalBaseline(page)
+  await submitExperimentalPrompt(page, promptPlan.prompt)
+
+  return {
+    page,
+    session: activeSession,
+    baseline,
+    promptText: promptPlan.prompt,
+    startedAt: Date.now(),
+  }
+}
+
+function buildTranscriptAfterResponse(transcript, responseText) {
+  return normalizeExperimentalTranscriptState({
+    systemText: transcript.systemText,
+    messages: [
+      ...transcript.messages,
+      ...(responseText
+        ? [
+            {
+              role: 'assistant',
+              text: responseText,
+            },
+          ]
+        : []),
+    ],
+  })
+}
+
+function finalizeExperimentalExecution(
+  session,
+  page,
+  transcript,
+  promptText,
+  responseText,
+  startedAt,
+) {
+  const updatedSession = persistExperimentalSession(session, {
+    conversationUrl: page.url(),
+    transcript: buildTranscriptAfterResponse(transcript, responseText),
+    lastRequestAt: new Date(startedAt).toISOString(),
+    lastResponseAt: new Date().toISOString(),
+    lastError: null,
+  })
+
+  experimentalRuntime.lastResponseAt = updatedSession.lastResponseAt
+  experimentalRuntime.browserStarted = true
+  experimentalRuntime.authenticated = true
+  clearExperimentalError()
+
+  return {
+    responseText,
+    promptTokens: estimateTokens(promptText),
+    outputTokens: estimateTokens(responseText),
+    durationMs: Date.now() - startedAt,
+    session: updatedSession,
+  }
+}
+
+function buildExperimentalCompletionPayload(publicModel, result) {
+  return {
+    id: `chatcmpl-${randomUUID()}`,
+    created: Math.floor(Date.now() / 1000),
+    model: publicModel,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: result.responseText,
+        },
+        finish_reason: 'stop',
+      },
+    ],
+    usage: {
+      prompt_tokens: result.promptTokens,
+      completion_tokens: result.outputTokens,
+      total_tokens: result.promptTokens + result.outputTokens,
+    },
+  }
+}
+
+async function executeExperimentalAnthropicRequest({ sessionName, body }) {
+  return withExperimentalQueue(async () => {
+    const publicModel = body.model || EXPERIMENTAL_CONFIG.modelAlias
+    const transcript = buildExperimentalAnthropicTranscript(body)
+
+    try {
+      const execution = await prepareExperimentalExecution(sessionName, transcript)
+      const snapshot = await waitForExperimentalResponse(
+        execution.page,
+        execution.baseline,
+      )
+      const result = finalizeExperimentalExecution(
+        execution.session,
+        execution.page,
+        transcript,
+        execution.promptText,
+        snapshot.text,
+        execution.startedAt,
+      )
+      return buildAnthropicResponseFromOpenAI(
+        buildExperimentalCompletionPayload(publicModel, result),
+        publicModel,
+      )
+    } catch (error) {
+      const session = getOrCreateExperimentalSession(sessionName)
+      persistExperimentalSession(session, {
+        lastError: error?.message || 'Unknown experimental bridge error.',
+      })
+      noteExperimentalError(error)
+      throw error
+    }
+  })
+}
+
+async function executeExperimentalOpenAIRequest({ sessionName, body }) {
+  return withExperimentalQueue(async () => {
+    const publicModel = body.model || EXPERIMENTAL_CONFIG.modelAlias
+    const transcript = buildExperimentalOpenAITranscript(body)
+
+    try {
+      const execution = await prepareExperimentalExecution(sessionName, transcript)
+      const snapshot = await waitForExperimentalResponse(
+        execution.page,
+        execution.baseline,
+      )
+      const result = finalizeExperimentalExecution(
+        execution.session,
+        execution.page,
+        transcript,
+        execution.promptText,
+        snapshot.text,
+        execution.startedAt,
+      )
+      return buildCompletionResponse(
+        publicModel,
+        buildExperimentalCompletionPayload(publicModel, result),
+      )
+    } catch (error) {
+      const session = getOrCreateExperimentalSession(sessionName)
+      persistExperimentalSession(session, {
+        lastError: error?.message || 'Unknown experimental bridge error.',
+      })
+      noteExperimentalError(error)
+      throw error
+    }
+  })
+}
+
+async function streamExperimentalAnthropicRequest(
+  res,
+  { sessionName, body },
+) {
+  return withExperimentalQueue(async () => {
+    const publicModel = body.model || EXPERIMENTAL_CONFIG.modelAlias
+    const transcript = buildExperimentalAnthropicTranscript(body)
+    const execution = await prepareExperimentalExecution(sessionName, transcript)
+    const msgId = `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`
+
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+    })
+
+    const writeEvent = (event, payload) => {
+      const ok = res.write(
+        `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`,
+      )
+      if (!ok) {
+        return new Promise((resolve) => res.once('drain', resolve))
+      }
+    }
+
+    await writeEvent('message_start', {
+      type: 'message_start',
+      message: {
+        id: msgId,
+        type: 'message',
+        role: 'assistant',
+        model: publicModel,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+        },
+      },
+    })
+    await writeEvent('content_block_start', {
+      type: 'content_block_start',
+      index: 0,
+      content_block: {
+        type: 'text',
+        text: '',
+      },
+    })
+
+    try {
+      const snapshot = await streamExperimentalResponse(
+        execution.page,
+        execution.baseline,
+        async (delta) => {
+          await writeEvent('content_block_delta', {
+            type: 'content_block_delta',
+            index: 0,
+            delta: {
+              type: 'text_delta',
+              text: delta,
+            },
+          })
+        },
+      )
+
+      const result = finalizeExperimentalExecution(
+        execution.session,
+        execution.page,
+        transcript,
+        execution.promptText,
+        snapshot.text,
+        execution.startedAt,
+      )
+
+      await writeEvent('content_block_stop', {
+        type: 'content_block_stop',
+        index: 0,
+      })
+      await writeEvent('message_delta', {
+        type: 'message_delta',
+        delta: {
+          stop_reason: 'end_turn',
+          stop_sequence: null,
+        },
+        usage: {
+          output_tokens: result.outputTokens,
+        },
+      })
+      await writeEvent('message_stop', {
+        type: 'message_stop',
+      })
+      res.end()
+    } catch (error) {
+      const session = getOrCreateExperimentalSession(sessionName)
+      persistExperimentalSession(session, {
+        lastError: error?.message || 'Unknown experimental bridge error.',
+      })
+      noteExperimentalError(error)
+      throw error
+    }
+  })
+}
+
+async function streamExperimentalOpenAIRequest(
+  res,
+  { sessionName, body },
+) {
+  return withExperimentalQueue(async () => {
+    const publicModel = body.model || EXPERIMENTAL_CONFIG.modelAlias
+    const transcript = buildExperimentalOpenAITranscript(body)
+    const execution = await prepareExperimentalExecution(sessionName, transcript)
+    const id = `chatcmpl-${randomUUID()}`
+    const created = Math.floor(Date.now() / 1000)
+
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+    })
+
+    const writeChunk = (payload) => {
+      const ok = res.write(`data: ${JSON.stringify(payload)}\n\n`)
+      if (!ok) {
+        return new Promise((resolve) => res.once('drain', resolve))
+      }
+    }
+
+    await writeChunk({
+      id,
+      object: 'chat.completion.chunk',
+      created,
+      model: publicModel,
+      choices: [
+        {
+          index: 0,
+          delta: {
+            role: 'assistant',
+          },
+          finish_reason: null,
+        },
+      ],
+    })
+
+    try {
+      const snapshot = await streamExperimentalResponse(
+        execution.page,
+        execution.baseline,
+        async (delta) => {
+          await writeChunk({
+            id,
+            object: 'chat.completion.chunk',
+            created,
+            model: publicModel,
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  content: delta,
+                },
+                finish_reason: null,
+              },
+            ],
+          })
+        },
+      )
+
+      finalizeExperimentalExecution(
+        execution.session,
+        execution.page,
+        transcript,
+        execution.promptText,
+        snapshot.text,
+        execution.startedAt,
+      )
+
+      await writeChunk({
+        id,
+        object: 'chat.completion.chunk',
+        created,
+        model: publicModel,
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            finish_reason: 'stop',
+          },
+        ],
+      })
+      res.write('data: [DONE]\n\n')
+      res.end()
+    } catch (error) {
+      const session = getOrCreateExperimentalSession(sessionName)
+      persistExperimentalSession(session, {
+        lastError: error?.message || 'Unknown experimental bridge error.',
+      })
+      noteExperimentalError(error)
+      throw error
+    }
+  })
+}
+
+function resolveExperimentalSessionName(body, headers, url) {
+  return safeExperimentalSessionName(
+    firstNonEmpty(
+      body?.session,
+      body?.metadata?.session_id,
+      body?.metadata?.conversation_id,
+      body?.user,
+      headers['x-freebuff-session'],
+      url?.searchParams.get('session'),
+    ) || CONFIG.defaultSessionId,
+  )
+}
+
+async function buildExperimentalStatus({ probe = false } = {}) {
+  ensureExperimentalSessionsLoaded()
+  const browserStarted = Boolean(
+    experimentalChromeProcess ||
+      experimentalBrowser ||
+      experimentalBrowserContext,
+  )
+  experimentalRuntime.browserStarted = browserStarted
+
+  if (probe && browserStarted) {
+    try {
+      await probeExperimentalAuthentication()
+    } catch (error) {
+      noteExperimentalError(error)
+    }
+  }
+
+  return {
+    ok:
+      EXPERIMENTAL_CONFIG.enabled &&
+      browserStarted &&
+      experimentalRuntime.authenticated,
+    status: !EXPERIMENTAL_CONFIG.enabled
+      ? 'disabled'
+      : browserStarted
+        ? experimentalRuntime.authenticated
+          ? 'healthy'
+          : 'degraded'
+        : 'idle',
+    enabled: EXPERIMENTAL_CONFIG.enabled,
+    browserStarted,
+    authenticated: experimentalRuntime.authenticated,
+    modelAlias: EXPERIMENTAL_CONFIG.modelAlias,
+    targetModel: EXPERIMENTAL_CONFIG.targetModel,
+    baseUrl: EXPERIMENTAL_CONFIG.baseUrl,
+    loginUrl: EXPERIMENTAL_CONFIG.loginUrl,
+    chromeExecutable: EXPERIMENTAL_CONFIG.chromeExecutable,
+    profileDir: EXPERIMENTAL_CONFIG.profileDir,
+    sessionStorePath: EXPERIMENTAL_CONFIG.sessionStorePath,
+    queueDepth: experimentalQueueDepth,
+    sessionCount: experimentalBridgeSessions.size,
+    lastError: experimentalRuntime.lastError,
+    lastErrorCode: experimentalRuntime.lastErrorCode,
+    lastObservedAt: experimentalRuntime.lastObservedAt,
+    lastResponseAt: experimentalRuntime.lastResponseAt,
+    sessions: listExperimentalSessions(),
+  }
+}
+
+async function buildExperimentalHealth() {
+  const status = await buildExperimentalStatus({ probe: true })
+  return {
+    ...status,
+    host: CONFIG.host,
+    port: CONFIG.port,
+    cwd: CONFIG.cwd,
+    compatibility: {
+      protocol: 'anthropic-messages',
+      supportsNativeTools: false,
+      supportsMcpTools: false,
+      supportsInstalledPluginTools: false,
+      textOnly: true,
+    },
+  }
+}
+
 function createBridgeSession(sessionName) {
   const now = new Date().toISOString()
   return {
@@ -2174,6 +3886,11 @@ function createBridgeSession(sessionName) {
     lastError: null,
     lastAccountSwitchAt: null,
     lastAccountSwitchReason: null,
+    // Freebuff session state (free mode only)
+    freebuffInstanceId: null,
+    freebuffSessionState: null,
+    freebuffSessionCreatedAt: null,
+    freebuffSessionUpdatedAt: null,
   }
 }
 
@@ -2188,12 +3905,16 @@ function getOrCreateBridgeSession(sessionName) {
 }
 
 function buildCodebuffMetadata(session) {
-  return {
+  const metadata = {
     client_id: session.clientId,
     run_id: session.runId,
     cost_mode: session.costMode,
     n: session.n,
   }
+  if (session.costMode === 'free' && session.freebuffInstanceId) {
+    metadata.freebuff_instance_id = session.freebuffInstanceId
+  }
+  return metadata
 }
 
 function inspectBridgeSession(sessionName) {
@@ -2366,6 +4087,7 @@ async function buildAdminOverview() {
       boundSessionCount: boundSessionCounts.get(account.accountId) || 0,
     })),
     config: await getRuntimeConfig(),
+    experimental: await buildExperimentalStatus(),
     sessions,
     compatibility: {
       protocol: 'anthropic-messages',
@@ -2475,6 +4197,110 @@ async function callCodebuffStreamRaw(token, body) {
   })
 }
 
+// Freebuff session management helpers (official /api/v1/freebuff/session endpoints)
+async function createFreebuffSession(token) {
+  const response = await fetchJson(`${CONFIG.apiBaseUrl}/api/v1/freebuff/session`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      Authorization: `Bearer ${token}`,
+      'x-codebuff-api-key': token,
+    },
+    body: JSON.stringify({}),
+    signal: AbortSignal.timeout(CONFIG.responseTimeoutMs),
+  })
+  if (!response.ok) {
+    throw buildCodebuffRequestError(response, 'Failed to create freebuff session.')
+  }
+  return response.data
+}
+
+async function getFreebuffSession(token, instanceId) {
+  const response = await fetchJson(`${CONFIG.apiBaseUrl}/api/v1/freebuff/session`, {
+    method: 'GET',
+    headers: {
+      'content-type': 'application/json',
+      Authorization: `Bearer ${token}`,
+      'x-codebuff-api-key': token,
+      'x-freebuff-instance-id': instanceId,
+    },
+    signal: AbortSignal.timeout(CONFIG.responseTimeoutMs),
+  })
+  if (!response.ok) {
+    throw buildCodebuffRequestError(response, 'Failed to get freebuff session.')
+  }
+  return response.data
+}
+
+async function deleteFreebuffSession(token, instanceId) {
+  const response = await fetchJson(`${CONFIG.apiBaseUrl}/api/v1/freebuff/session`, {
+    method: 'DELETE',
+    headers: {
+      'content-type': 'application/json',
+      Authorization: `Bearer ${token}`,
+      'x-codebuff-api-key': token,
+      'x-freebuff-instance-id': instanceId,
+    },
+    signal: AbortSignal.timeout(CONFIG.responseTimeoutMs),
+  })
+  if (!response.ok) {
+    throw buildCodebuffRequestError(response, 'Failed to delete freebuff session.')
+  }
+  return response.data
+}
+
+function clearFreebuffSession(session) {
+  if (!session) return
+  session.freebuffInstanceId = null
+  session.freebuffSessionState = null
+  session.freebuffSessionCreatedAt = null
+  session.freebuffSessionUpdatedAt = null
+}
+
+async function ensureFreebuffSession(token, session) {
+  if (session.costMode !== 'free') return
+  if (session.freebuffInstanceId) {
+    try {
+      const state = await getFreebuffSession(token, session.freebuffInstanceId)
+      session.freebuffSessionState = state?.status || null
+      session.freebuffSessionUpdatedAt = new Date().toISOString()
+      if (state?.status === 'active') {
+        return
+      }
+      if (state?.status === 'ended' || state?.status === 'superseded' || state?.status === 'none') {
+        clearFreebuffSession(session)
+      }
+    } catch {
+      clearFreebuffSession(session)
+    }
+  }
+  if (!session.freebuffInstanceId) {
+    const created = await createFreebuffSession(token)
+    session.freebuffInstanceId = created?.instanceId || null
+    session.freebuffSessionState = created?.status || 'queued'
+    session.freebuffSessionCreatedAt = new Date().toISOString()
+    session.freebuffSessionUpdatedAt = session.freebuffSessionCreatedAt
+  }
+}
+
+function isFreebuffGateError(response) {
+  if (!response) return false
+  const code = response.status
+  return code === 426 || code === 428 || code === 429 || code === 409 || code === 410
+}
+
+function isFreebuffSessionRecoverable(response) {
+  if (!response) return false
+  const code = response.status
+  return code === 409 || code === 410 || code === 426
+}
+
+function isFreebuffWaitingRoomError(response) {
+  if (!response) return false
+  const code = response.status
+  return code === 428 || code === 429
+}
+
 async function* readOpenAISseStream(response) {
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
@@ -2549,6 +4375,10 @@ async function executeCodebuffChatCompletion({
 }) {
   await ensureActiveRun(token, session)
 
+  if (session.costMode === 'free') {
+    await ensureFreebuffSession(token, session)
+  }
+
   let response = await callCodebuffJson(token, '/api/v1/chat/completions', {
     ...upstreamBody,
     codebuff_metadata: buildCodebuffMetadata(session),
@@ -2566,7 +4396,25 @@ async function executeCodebuffChatCompletion({
     })
   }
 
+  if (!response.ok && session.costMode === 'free' && isFreebuffSessionRecoverable(response)) {
+    logger.warn('codebuff', 'freebuff session recoverable error, resetting', { session: session.session, status: response.status })
+    clearFreebuffSession(session)
+    await ensureFreebuffSession(token, session)
+    response = await callCodebuffJson(token, '/api/v1/chat/completions', {
+      ...upstreamBody,
+      codebuff_metadata: buildCodebuffMetadata(session),
+    })
+  }
+
   if (!response.ok) {
+    if (session.costMode === 'free' && isFreebuffWaitingRoomError(response)) {
+      const detail = extractCodebuffErrorDetail(response.data)
+      const error = new Error(detail?.message || 'Freebuff waiting room required.')
+      error.statusCode = response.status
+      error.errorCode = detail?.code || 'waiting_room_required'
+      error.errorType = detail?.type || 'server_error'
+      throw error
+    }
     throw buildCodebuffRequestError(response, 'Codebuff completion request failed.')
   }
 
@@ -2941,6 +4789,9 @@ async function streamAnthropicRequest(res, { sessionName, body, headers, url }) 
 
     const acquireUpstream = async (token, forSession) => {
       await ensureActiveRun(token, forSession)
+      if (forSession.costMode === 'free') {
+        await ensureFreebuffSession(token, forSession)
+      }
       const rawBody = { ...upstreamBodyBase, codebuff_metadata: buildCodebuffMetadata(forSession) }
       let upstream = await callCodebuffStreamRaw(token, rawBody)
       if (!upstream.ok) {
@@ -2957,7 +4808,24 @@ async function streamAnthropicRequest(res, { sessionName, body, headers, url }) 
             codebuff_metadata: buildCodebuffMetadata(forSession),
           })
         }
+        if (!upstream.ok && forSession.costMode === 'free' && isFreebuffSessionRecoverable({ status: upstream.status, data, text })) {
+          logger.warn('codebuff', 'freebuff session recoverable error in stream, resetting', { session: forSession.session, status: upstream.status })
+          clearFreebuffSession(forSession)
+          await ensureFreebuffSession(token, forSession)
+          upstream = await callCodebuffStreamRaw(token, {
+            ...rawBody,
+            codebuff_metadata: buildCodebuffMetadata(forSession),
+          })
+        }
         if (!upstream.ok) {
+          if (forSession.costMode === 'free' && isFreebuffWaitingRoomError({ status: upstream.status, data, text })) {
+            const detail = extractCodebuffErrorDetail(data)
+            const error = new Error(detail?.message || 'Freebuff waiting room required.')
+            error.statusCode = upstream.status
+            error.errorCode = detail?.code || 'waiting_room_required'
+            error.errorType = detail?.type || 'server_error'
+            throw error
+          }
           const errText = upstream.bodyUsed ? text : await upstream.text()
           let errData = null
           try { errData = JSON.parse(errText) } catch {}
@@ -3767,6 +5635,130 @@ const server = createServer(async (req, res) => {
       return
     }
 
+    if (req.method === 'GET' && url.pathname === '/experimental/health') {
+      sendJson(res, 200, await buildExperimentalHealth())
+      return
+    }
+
+    if (
+      req.method === 'GET' &&
+      url.pathname === '/experimental/v1/models'
+    ) {
+      sendJson(res, 200, buildExperimentalModelsResponse())
+      return
+    }
+
+    if (
+      req.method === 'GET' &&
+      url.pathname === '/experimental/v1/chatgpt-web/status'
+    ) {
+      sendJson(res, 200, {
+        ok: true,
+        status: await buildExperimentalStatus({ probe: true }),
+      })
+      return
+    }
+
+    if (
+      req.method === 'POST' &&
+      url.pathname === '/experimental/v1/chatgpt-web/browser/start'
+    ) {
+      ensureExperimentalEnabled()
+      ensureExperimentalDirs()
+      startExperimentalChromeProcess()
+      experimentalRuntime.browserStarted = true
+      ensureExperimentalBrowserContext().catch((error) => {
+        noteExperimentalError(error)
+      })
+      sendJson(res, 202, {
+        ok: true,
+        browserStarted: true,
+        authenticated: experimentalRuntime.authenticated,
+        pending: true,
+        status: await buildExperimentalStatus(),
+      })
+      return
+    }
+
+    if (
+      req.method === 'POST' &&
+      url.pathname === '/experimental/v1/chatgpt-web/reset'
+    ) {
+      const body = await readJsonBody(req)
+      const sessionName = resolveExperimentalSessionName(body, req.headers, url)
+      await resetExperimentalSessionState(sessionName, true)
+      sendJson(res, 200, {
+        ok: true,
+        reset: true,
+        session: sessionName,
+      })
+      return
+    }
+
+    if (
+      req.method === 'POST' &&
+      url.pathname === '/experimental/v1/messages/count_tokens'
+    ) {
+      const body = await readJsonBody(req)
+      const promptText = [
+        normalizeAnthropicSystem(body?.system),
+        JSON.stringify(body?.messages || []),
+      ]
+        .filter(Boolean)
+        .join('\n')
+
+      sendJson(res, 200, {
+        input_tokens: estimateTokens(promptText),
+      })
+      return
+    }
+
+    if (
+      req.method === 'POST' &&
+      url.pathname === '/experimental/v1/messages'
+    ) {
+      const body = await readJsonBody(req)
+      const sessionName = resolveExperimentalSessionName(body, req.headers, url)
+
+      if (body.stream === true) {
+        await streamExperimentalAnthropicRequest(res, {
+          sessionName,
+          body,
+        })
+        return
+      }
+
+      const payload = await executeExperimentalAnthropicRequest({
+        sessionName,
+        body,
+      })
+      sendJson(res, 200, payload)
+      return
+    }
+
+    if (
+      req.method === 'POST' &&
+      url.pathname === '/experimental/v1/chat/completions'
+    ) {
+      const body = await readJsonBody(req)
+      const sessionName = resolveExperimentalSessionName(body, req.headers, url)
+
+      if (body.stream === true) {
+        await streamExperimentalOpenAIRequest(res, {
+          sessionName,
+          body,
+        })
+        return
+      }
+
+      const payload = await executeExperimentalOpenAIRequest({
+        sessionName,
+        body,
+      })
+      sendJson(res, 200, payload)
+      return
+    }
+
     if (req.method === 'GET' && url.pathname === '/v1/freebuff/admin/overview') {
       sendJson(res, 200, await buildAdminOverview())
       return
@@ -4085,7 +6077,10 @@ const server = createServer(async (req, res) => {
     sendJson(res, statusCode, {
       error: {
         message: error?.message || 'Unknown error',
-        type: statusCode === 401 ? 'authentication_error' : 'server_error',
+        type:
+          error?.errorType ||
+          (statusCode === 401 ? 'authentication_error' : 'server_error'),
+        code: error?.errorCode || null,
       },
     })
   }
